@@ -1,0 +1,73 @@
+# Supported types: IP address, domain, SHA256/SHA1/MD5 hash, URL
+
+# --- Known Malicious Test IOCs ---
+# NOTE: These are commonly reported malicious/test-malware indicators and are for defensive testing only.
+185.220.101.1
+185.220.101.2
+185.220.101.3
+185.220.101.4
+185.220.101.6
+185.220.101.8
+db349b97c37d22f5ea1d1841e3c89eb4
+44d88612fea8a8f36de82e1278abb02f
+275a021bbfb6489e54d471899f7db9d1
+
+# --- IPs ---
+223.112.202.177
+45.61.49.78
+66.55.64.137
+185.220.101.1
+94.103.84.81
+1.1.1.1
+8.8.8.8
+8.8.4.4
+208.67.222.222
+208.67.220.220
+9.9.9.9
+149.112.112.112
+64.6.64.6
+64.6.65.6
+
+# --- Domains ---
+example.com
+example.org
+example.net
+iana.org
+wikipedia.org
+mozilla.org
+openai.com
+microsoft.com
+google.com
+github.com
+cloudflare.com
+facebook.com
+apple.com
+amazon.com
+netflix.com
+reddit.com
+linkedin.com
+dropbox.com
+slack.com
+zoom.us
+
+# --- URLs ---
+https://example.com
+https://example.org
+https://wikipedia.org
+https://github.com
+https://openai.com
+https://cloudflare.com
+https://microsoft.com
+https://google.com
+https://apple.com
+https://reddit.com
+
+# --- Hashes (SHA256) ---
+# a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4
+# 0c415dd718e3b3728707d579cf8214f54c2942e964975a5f925e0b82fea644b4
+# b181e6e08cfdebbd9cfcb0e3ccd3976ed51c7edefc69ec826e73d3324d646b2e
+
+# --- Notes ---
+# 1) Use --max-iocs to cap requests for quota control.
+# 2) Use --batch-size and --batch-cooldown for very large lists.
+# 3) Duplicates are automatically removed by threat_lookup.py.

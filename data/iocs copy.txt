@@ -1,0 +1,56 @@
+# Supported types: IP address, domain, SHA256/SHA1/MD5 hash, URL
+
+# --- Known Malicious Test IOCs ---
+# NOTE: These are commonly reported malicious/test-malware indicators and are for defensive testing only.
+db349b97c37d22f5ea1d1841e3c89eb4
+44d88612fea8a8f36de82e1278abb02f
+275a021bbfb6489e54d471899f7db9d1
+
+# --- IPs ---
+223.112.202.177
+45.61.49.78
+66.55.64.137
+185.220.101.1
+94.103.84.81
+8.8.4.4
+208.67.222.222
+208.67.220.220
+9.9.9.9
+149.112.112.112
+64.6.64.6
+64.6.65.6
+```
+118.26.111.107
+125.20.210.182
+158.101.161.27
+45.90.13.191
+45.148.10.121
+45.148.10.147
+64.226.126.224
+65.49.1.108
+80.82.77.33
+80.82.77.139
+93.174.95.106
+167.94.146.54
+167.94.146.56
+1.212.225.99
+2.26.49.39
+2.57.121.25
+3.131.220.121
+14.29.198.130
+14.103.10.167
+16.58.56.214
+18.116.101.220
+```
+
+
+
+# --- Hashes (SHA256) ---
+# a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4c5d6e7f8a3b4
+# 0c415dd718e3b3728707d579cf8214f54c2942e964975a5f925e0b82fea644b4
+# b181e6e08cfdebbd9cfcb0e3ccd3976ed51c7edefc69ec826e73d3324d646b2e
+
+# --- Notes ---
+# 1) Use --max-iocs to cap requests for quota control.
+# 2) Use --batch-size and --batch-cooldown for very large lists.
+# 3) Duplicates are automatically removed by threat_lookup.py.
