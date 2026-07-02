@@ -75,8 +75,14 @@ SILENTPUSH_SPQL_QUERY_TEMPLATE_ALT = os.getenv(
     "SELECT * FROM scandata WHERE indicator='{indicator}' LIMIT 25",
 )
 SPUR_API_KEY = os.getenv("SPUR_API_KEY")
+SPUR_CONTEXT_DT = os.getenv("SPUR_CONTEXT_DT", "").strip()
+SPUR_USE_MAXMIND_GEO = os.getenv("SPUR_USE_MAXMIND_GEO", "false").strip().lower() in {"1", "true", "yes", "on"}
+SPUR_ENABLE_TAG_METADATA = os.getenv("SPUR_ENABLE_TAG_METADATA", "true").strip().lower() in {"1", "true", "yes", "on"}
+SPUR_MAX_TAG_METADATA = max(0, int(os.getenv("SPUR_MAX_TAG_METADATA", "3") or "3"))
 RL_SPECTRA_BASE_URL = os.getenv("RL_SPECTRA_BASE_URL", "").strip().rstrip("/")
 RL_SPECTRA_TOKEN = os.getenv("RL_SPECTRA_TOKEN")
+
+_SPUR_TAG_METADATA_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
 def refresh_runtime_config(env_path: str = ".env") -> None:
@@ -92,6 +98,7 @@ def refresh_runtime_config(env_path: str = ".env") -> None:
     global SILENTPUSH_ENABLE_THREAT_CHECK, SILENTPUSH_THREAT_CHECK_BASE_URL
     global SILENTPUSH_BPH_SUSPECTED_DOMAIN_COUNT, SILENTPUSH_BPH_LIKELY_DOMAIN_COUNT
     global SILENTPUSH_VERBOSE_NON_EXPLORE_ERRORS, SILENTPUSH_VERBOSE_EXPLORE_ERRORS, SPUR_API_KEY
+    global SPUR_CONTEXT_DT, SPUR_USE_MAXMIND_GEO, SPUR_ENABLE_TAG_METADATA, SPUR_MAX_TAG_METADATA
     global SILENTPUSH_SPQL_PAYLOAD_MODE, SILENTPUSH_SPQL_QUERY_TEMPLATE, SILENTPUSH_SPQL_QUERY_TEMPLATE_ALT
     global RL_SPECTRA_BASE_URL, RL_SPECTRA_TOKEN
 
@@ -131,8 +138,14 @@ def refresh_runtime_config(env_path: str = ".env") -> None:
         "SELECT * FROM scandata WHERE indicator='{indicator}' LIMIT 25",
     )
     SPUR_API_KEY = os.getenv("SPUR_API_KEY")
+    SPUR_CONTEXT_DT = os.getenv("SPUR_CONTEXT_DT", "").strip()
+    SPUR_USE_MAXMIND_GEO = os.getenv("SPUR_USE_MAXMIND_GEO", "false").strip().lower() in {"1", "true", "yes", "on"}
+    SPUR_ENABLE_TAG_METADATA = os.getenv("SPUR_ENABLE_TAG_METADATA", "true").strip().lower() in {"1", "true", "yes", "on"}
+    SPUR_MAX_TAG_METADATA = max(0, int(os.getenv("SPUR_MAX_TAG_METADATA", "3") or "3"))
     RL_SPECTRA_BASE_URL = os.getenv("RL_SPECTRA_BASE_URL", "").strip().rstrip("/")
     RL_SPECTRA_TOKEN = os.getenv("RL_SPECTRA_TOKEN")
+
+    _SPUR_TAG_METADATA_CACHE.clear()
 
 TIMEOUT = 5
 MAX_RETRIES = 0
@@ -631,6 +644,50 @@ def _spur_verdict_from_signals(risks: List[str], tunnel_count: int, proxy_count:
     return "Benign"
 
 
+def _spur_sanitized_dt() -> str:
+    raw = (SPUR_CONTEXT_DT or "").strip()
+    if not raw:
+        return ""
+    return raw if re.match(r"^\d{8}$", raw) else ""
+
+
+async def _spur_fetch_tag_metadata(session, tag: str) -> Dict[str, Any]:
+    tag_norm = str(tag or "").strip().upper()
+    if not tag_norm:
+        return {}
+
+    cached = _SPUR_TAG_METADATA_CACHE.get(tag_norm)
+    if cached is not None:
+        return cached
+
+    status, data, request_error = await _request_json_with_retry(
+        session,
+        "GET",
+        f"https://api.spur.us/v2/metadata/tags/{quote(tag_norm, safe='')}",
+        headers={"Token": SPUR_API_KEY},
+    )
+    if request_error or status in {400, 401, 403, 404, 429} or (status and status >= 500) or not isinstance(data, dict):
+        _SPUR_TAG_METADATA_CACHE[tag_norm] = {}
+        return {}
+
+    metadata = {
+        "name": data.get("name"),
+        "description": data.get("description"),
+        "website": data.get("website"),
+        "categories": (data.get("categories") or [])[:8],
+        "protocols": (data.get("protocols") or [])[:8],
+        "platforms": (data.get("platforms") or [])[:8],
+        "is_anonymous": data.get("isAnonymous"),
+        "is_callback_proxy": data.get("isCallbackProxy"),
+        "is_tracked": data.get("isTracked"),
+        "max_age_days": data.get("maxAgeDays"),
+        "metrics": data.get("metrics") if isinstance(data.get("metrics"), dict) else None,
+    }
+    metadata = {k: v for k, v in metadata.items() if v not in (None, "", [], {})}
+    _SPUR_TAG_METADATA_CACHE[tag_norm] = metadata
+    return metadata
+
+
 def _silentpush_compact_payload(value: Any, depth: int = 0, max_depth: int = 2, max_items: int = 10):
     if depth >= max_depth:
         if isinstance(value, (dict, list)):
@@ -1076,7 +1133,10 @@ async def query_silentpush(session, ioc, ioc_type):
             "hint": "Silent Push rejected this request. Confirm SILENTPUSH_API_KEY is a valid Explore API key and the IOC format is supported.",
         }
 
-    payload = data.get("response") or {}
+    payload = data.get("response") if isinstance(data, dict) else {}
+    if not isinstance(payload, dict):
+        payload = {}
+    top_row: Dict[str, Any] = {}
     if query_type == "ip":
         ip_rows = payload.get("ip2asn") or []
         top_row = ip_rows[0] if ip_rows and isinstance(ip_rows[0], dict) else {}
@@ -1521,12 +1581,19 @@ async def query_spur(session, ioc, ioc_type):
 
     url = f"https://api.spur.us/v2/context/{ioc}"
     headers = {"Token": SPUR_API_KEY}
+    params = {}
+    spur_dt = _spur_sanitized_dt()
+    if spur_dt:
+        params["dt"] = spur_dt
+    if SPUR_USE_MAXMIND_GEO:
+        params["mmgeo"] = "1"
 
     status, data, request_error, response_headers = await _request_json_with_retry(
         session,
         "GET",
         url,
         headers=headers,
+        params=params or None,
         return_headers=True,
     )
     if request_error:
@@ -1544,6 +1611,10 @@ async def query_spur(session, ioc, ioc_type):
         return {"source": "spur", "score": 0, "error": "rate_limited"}
     if status == 400:
         return {"source": "spur", "score": 0, "error": "invalid_query"}
+    if status == 500:
+        return {"source": "spur", "score": 0, "error": "http_500"}
+    if status and status >= 400:
+        return {"source": "spur", "score": 0, "error": f"http_{status}"}
 
     infrastructure = str(data.get("infrastructure", "") or "")
     risks = [str(r) for r in (data.get("risks") or []) if r]
@@ -1586,6 +1657,13 @@ async def query_spur(session, ioc, ioc_type):
     score = min(20, score)
     spur_verdict = _spur_verdict_from_signals(risks, len(tunnels), len(proxies))
 
+    tag_metadata: Dict[str, Dict[str, Any]] = {}
+    if SPUR_ENABLE_TAG_METADATA and SPUR_MAX_TAG_METADATA > 0 and tunnel_tags:
+        for tag in sorted(tunnel_tags)[:SPUR_MAX_TAG_METADATA]:
+            md = await _spur_fetch_tag_metadata(session, tag)
+            if md:
+                tag_metadata[tag] = md
+
     result = {
         "source": "spur",
         "score": score,
@@ -1616,11 +1694,16 @@ async def query_spur(session, ioc, ioc_type):
         "tunnel_types": sorted(tunnel_types)[:10],
         "tunnel_operators": sorted(tunnel_operators)[:10],
         "tunnel_tags": sorted(tunnel_tags)[:10],
+        "mmgeo_enabled": SPUR_USE_MAXMIND_GEO,
     }
+    if spur_dt:
+        result["query_dt"] = spur_dt
     if client_behaviors:
         result["client_behaviors"] = client_behaviors[:10]
     if ai_obj:
         result["ai"] = ai_obj
+    if tag_metadata:
+        result["tag_metadata"] = tag_metadata
     return result
 
 
