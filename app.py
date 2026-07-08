@@ -132,6 +132,17 @@ SOURCE_BRAND = {
     "ReversingLabs": "var(--source-unified-color)",
 }
 
+# Keep card labels high-contrast on white tile backgrounds in both light/dark themes.
+SOURCE_BRAND_CARD = {
+    "VirusTotal": "#111827",
+    "AlienVault OTX": "#111827",
+    "ThreatFox": "#111827",
+    "AbuseIPDB": "#111827",
+    "Silent Push": "#111827",
+    "Spur": "#111827",
+    "ReversingLabs": "#111827",
+}
+
 SOURCE_DISPLAY = {
     "virustotal": "VirusTotal",
     "alienvault": "AlienVault OTX",
@@ -222,12 +233,55 @@ def _fmt_reversinglabs_value(value):
     return str(value)
 
 
+def _api_usage_value(src: dict, key: str):
+    usage = src.get("api_usage") or {}
+    if isinstance(usage, dict):
+        val = usage.get(key)
+        if val not in (None, "", []):
+            return val
+
+    fallback_map = {
+        "remaining": src.get("balance_remaining"),
+        "used": None,
+        "limit": None,
+        "reset": src.get("result_dt"),
+        "window": None,
+    }
+    return fallback_map.get(key)
+
+
+def _render_api_usage_indicator(src: dict, provider_label: str) -> None:
+    remaining = _api_usage_value(src, "remaining")
+    used = _api_usage_value(src, "used")
+    limit = _api_usage_value(src, "limit")
+    reset = _api_usage_value(src, "reset")
+    window = _api_usage_value(src, "window")
+
+    st.markdown("**API usage:**")
+    u1, u2, u3, u4 = st.columns(4)
+    u1.metric("Remaining", _fmt_simple_value(remaining))
+    u2.metric("Used", _fmt_simple_value(used))
+    u3.metric("Limit", _fmt_simple_value(limit))
+    u4.metric("Reset/Window", _fmt_simple_value(reset or window))
+
+    if all(v in (None, "", []) for v in (remaining, used, limit, reset, window)):
+        st.caption(f"{provider_label} did not return usage-limit headers for this request.")
+
+
 def _labelize_reversinglabs_key(key: str) -> str:
     text = str(key).replace("_", " ").replace(".", " > ")
     return text[:1].upper() + text[1:] if text else text
 
 
 def _render_reversinglabs_source(src: dict) -> None:
+    _render_api_usage_indicator(src, "ReversingLabs")
+
+    if src.get("error"):
+        st.warning(f"ReversingLabs error: {src.get('error')}")
+        if src.get("hint"):
+            st.caption(str(src.get("hint")))
+        return
+
     verdict = src.get("rl_verdict") or "Unknown"
     classification = src.get("classification")
     threat_level = src.get("threat_level")
@@ -324,6 +378,14 @@ def _render_reversinglabs_source(src: dict) -> None:
 
 
 def _render_silentpush_source(src: dict) -> None:
+    _render_api_usage_indicator(src, "Silent Push")
+
+    if src.get("error"):
+        st.warning(f"Silent Push error: {src.get('error')}")
+        if src.get("hint"):
+            st.caption(str(src.get("hint")))
+        return
+
     risk_score = src.get("sp_risk_score")
     verdict = src.get("sp_verdict") or "Unknown"
     listed = bool(src.get("is_listed"))
@@ -390,6 +452,180 @@ def _render_silentpush_source(src: dict) -> None:
     if compact_details:
         with st.expander("Silent Push technical details", expanded=False):
             st.json(compact_details)
+
+
+def _render_spur_source(src: dict) -> None:
+    _render_api_usage_indicator(src, "Spur")
+
+    if src.get("error"):
+        st.warning(f"Spur error: {src.get('error')}")
+        if src.get("hint"):
+            st.caption(str(src.get("hint")))
+        return
+
+    verdict = src.get("spur_verdict") or "Unknown"
+    risks = src.get("risks") or []
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Verdict", _fmt_simple_value(verdict))
+    c2.metric("Risk Signals", len(risks))
+    c3.metric("Tunnels", _fmt_simple_value(src.get("tunnel_count")))
+    c4.metric("Proxies", _fmt_simple_value(src.get("proxy_count")))
+
+    st.markdown("**Primary context:**")
+    rows = [
+        ("Infrastructure", src.get("infrastructure")),
+        ("Organization", src.get("organization")),
+        ("AS Organization", src.get("as_organization")),
+        ("ASN", src.get("asn")),
+        ("Country", src.get("country")),
+        ("City", src.get("city")),
+    ]
+    for label, value in rows:
+        if value not in (None, "", []):
+            st.markdown(f"- **{label}:** {value}")
+
+    if risks:
+        st.markdown(f"- **Risks:** {', '.join(str(r) for r in risks[:10])}")
+
+    with st.expander("Spur technical details", expanded=False):
+        st.json({k: v for k, v in src.items() if k not in {"source"}})
+
+
+def _source_by_name(detail: dict, source_name: str) -> dict:
+    for src in detail.get("sources", []) or []:
+        if src.get("source") == source_name:
+            return src
+    return {}
+
+
+def _collect_flagging_sources(detail: dict) -> list:
+    flagged = []
+
+    for src in detail.get("sources", []) or []:
+        if src.get("error"):
+            continue
+
+        source_name = str(src.get("source") or "").strip()
+        display_name = SOURCE_DISPLAY.get(source_name, source_name.replace("_", " ").title())
+
+        if source_name == "virustotal":
+            malicious = int(src.get("malicious") or 0)
+            suspicious = int(src.get("suspicious") or 0)
+            if malicious > 0 or suspicious > 0:
+                flagged.append(f"{display_name}: malicious={malicious}, suspicious={suspicious}")
+            continue
+
+        if source_name == "alienvault":
+            pulses = int(src.get("pulses") or 0)
+            if pulses > 0:
+                flagged.append(f"{display_name}: {pulses} threat pulse(s)")
+            continue
+
+        if source_name == "threatfox":
+            matches = int(src.get("matches") or 0)
+            confidence = int(src.get("max_confidence") or 0)
+            if matches > 0:
+                flagged.append(f"{display_name}: {matches} match(es), max confidence={confidence}/100")
+            continue
+
+        if source_name == "abuseipdb":
+            abuse_score = int(src.get("abuse_score") or 0)
+            if abuse_score > 0:
+                flagged.append(f"{display_name}: abuse confidence={abuse_score}/100")
+            continue
+
+        if source_name == "silentpush":
+            risk_score = int(src.get("sp_risk_score") or 0)
+            verdict = str(src.get("sp_verdict") or "Unknown")
+            listed = bool(src.get("is_listed")) or bool(src.get("threat_check_listed"))
+            bph = str(src.get("bulletproof_hosting_likelihood") or "").lower()
+            if listed or risk_score >= 50 or bph in {"suspected", "likely"}:
+                suffix = []
+                if listed:
+                    suffix.append("listed")
+                if bph in {"suspected", "likely"}:
+                    suffix.append(f"bulletproof={bph}")
+                suffix_txt = f" ({', '.join(suffix)})" if suffix else ""
+                flagged.append(f"{display_name}: verdict={verdict}, risk score={risk_score}/100{suffix_txt}")
+            continue
+
+        if source_name == "spur":
+            verdict = str(src.get("spur_verdict") or "Unknown")
+            risks = len(src.get("risks") or [])
+            tunnels = int(src.get("tunnel_count") or 0)
+            proxies = int(src.get("proxy_count") or 0)
+            if verdict in {"Malicious", "Suspicious"} or risks > 0 or tunnels > 0 or proxies > 0:
+                flagged.append(
+                    f"{display_name}: verdict={verdict}, risks={risks}, tunnels={tunnels}, proxies={proxies}"
+                )
+            continue
+
+        if source_name == "reversinglabs":
+            verdict = str(src.get("rl_verdict") or "Unknown")
+            malicious = int(src.get("third_party_malicious") or 0)
+            suspicious = int(src.get("third_party_suspicious") or 0)
+            if verdict in {"Malicious", "Suspicious"} or malicious > 0 or suspicious > 0:
+                flagged.append(
+                    f"{display_name}: verdict={verdict}, third-party flags m={malicious} s={suspicious}"
+                )
+            continue
+
+    return flagged
+
+
+def _collect_quick_whois_summary(detail: dict) -> list:
+    rl = _source_by_name(detail, "reversinglabs")
+    sp = _source_by_name(detail, "silentpush")
+    vt = _source_by_name(detail, "virustotal")
+    abuse = _source_by_name(detail, "abuseipdb")
+
+    def first_non_empty(*values):
+        for v in values:
+            if v not in (None, "", [], {}):
+                return v
+        return None
+
+    org = first_non_empty(rl.get("organization"), rl.get("as_owner"), sp.get("as_org"), vt.get("as_owner"), abuse.get("isp"))
+    country = first_non_empty(rl.get("country"), sp.get("country"), sp.get("country_code"), vt.get("country"), abuse.get("country"))
+    asn = first_non_empty(rl.get("asn"), sp.get("asn_lookup"), sp.get("asn"), sp.get("answer_asn"), vt.get("asn"), abuse.get("asn"))
+    network = first_non_empty(rl.get("network"), sp.get("subnet"), vt.get("network"))
+    registrar = first_non_empty(rl.get("registrar"), sp.get("registrar"), vt.get("registrar"))
+    registrant = first_non_empty(rl.get("registrant"), rl.get("organization"))
+    created = first_non_empty(rl.get("created"), sp.get("registration_date"), vt.get("creation_date"))
+    updated = first_non_empty(rl.get("updated"), sp.get("last_changed_date"))
+    expires = first_non_empty(rl.get("expires"), sp.get("expiration_date"))
+    whois_server = first_non_empty(sp.get("whois_server"))
+
+    nameservers = first_non_empty(rl.get("nameservers"), sp.get("nameservers"))
+    nameserver_txt = None
+    if isinstance(nameservers, list) and nameservers:
+        nameserver_txt = ", ".join(str(v) for v in nameservers[:4])
+
+    summary_lines = []
+    if org is not None:
+        summary_lines.append(f"Owner/Org: {org}")
+    if country is not None:
+        summary_lines.append(f"Country: {country}")
+    if asn is not None:
+        summary_lines.append(f"ASN: {asn}")
+    if network is not None:
+        summary_lines.append(f"Network/Subnet: {network}")
+    if registrar is not None:
+        summary_lines.append(f"Registrar: {registrar}")
+    if registrant is not None:
+        summary_lines.append(f"Registrant: {registrant}")
+    if created is not None:
+        summary_lines.append(f"Created: {created}")
+    if updated is not None:
+        summary_lines.append(f"Updated: {updated}")
+    if expires is not None:
+        summary_lines.append(f"Expires: {expires}")
+    if whois_server is not None:
+        summary_lines.append(f"WHOIS Server: {whois_server}")
+    if nameserver_txt is not None:
+        summary_lines.append(f"Nameservers: {nameserver_txt}")
+
+    return summary_lines
 
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
@@ -550,12 +786,12 @@ if st.session_state.results is None:
         ok = health.get(name, False)
         color = "#16a34a" if ok else "#dc2626"
         status = "✓ Connected" if ok else "✗ No API Key"
-        source_color = SOURCE_BRAND.get(name, "#111827")
+        source_color = SOURCE_BRAND_CARD.get(name, "#111827")
         col.markdown(f"""
         <div class="kpi-card">
             <div style="font-size:2rem;">{icon}</div>
             <div style="font-weight:700; margin-top:.4rem; color:{source_color};">{name}</div>
-            <div style="color:#6b7280; font-size:.78rem; margin-top:.2rem;">{coverage}</div>
+            <div style="color:#374151; font-size:.78rem; margin-top:.2rem;">{coverage}</div>
             <div style="color:{color}; font-size:.8rem; margin-top:.4rem; font-weight:600;">{status}</div>
         </div>
         """, unsafe_allow_html=True)
@@ -684,6 +920,19 @@ if detail:
         for r in reasons:
             st.markdown(f"- {r}")
 
+    if detail.get("verdict") == "Malicious":
+        flagged_sources = _collect_flagging_sources(detail)
+        if flagged_sources:
+            st.markdown("**Flagged by (all contributing sources):**")
+            for line in flagged_sources:
+                st.markdown(f"- {line}")
+
+        quick_whois = _collect_quick_whois_summary(detail)
+        if quick_whois:
+            st.markdown("**IOC context (WHOIS/network):**")
+            for line in quick_whois:
+                st.markdown(f"- {line}")
+
     st.markdown("---")
 
     # Per-source breakdown
@@ -700,12 +949,16 @@ if detail:
                 unsafe_allow_html=True,
             )
 
-            if src_name == "silentpush" and not has_error:
+            if src_name == "silentpush":
                 _render_silentpush_source(src)
                 continue
 
-            if src_name == "reversinglabs" and not has_error:
+            if src_name == "reversinglabs":
                 _render_reversinglabs_source(src)
+                continue
+
+            if src_name == "spur":
+                _render_spur_source(src)
                 continue
 
             skip = {"source", "score"}

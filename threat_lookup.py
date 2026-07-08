@@ -210,6 +210,47 @@ def _retry_delay(attempt: int) -> float:
     return min(delay, RETRY_MAX_DELAY)
 
 
+def _header_value(headers: Dict[str, Any], *keys: str) -> Any:
+    if not isinstance(headers, dict):
+        return None
+    header_map = {str(k).lower(): v for k, v in headers.items()}
+    for key in keys:
+        val = header_map.get(str(key).lower())
+        if val not in (None, "", []):
+            return val
+    return None
+
+
+def _to_int_or_none(value: Any):
+    if value in (None, "", []):
+        return None
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return None
+
+
+def _extract_api_usage(headers: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(headers, dict) or not headers:
+        return {}
+
+    usage = {
+        "limit": _header_value(headers, "x-ratelimit-limit", "x-rate-limit-limit", "ratelimit-limit", "x-daily-limit"),
+        "remaining": _header_value(headers, "x-ratelimit-remaining", "x-rate-limit-remaining", "ratelimit-remaining", "x-balance-remaining", "x-daily-remaining"),
+        "used": _header_value(headers, "x-ratelimit-used", "x-rate-limit-used", "ratelimit-used", "x-balance-used", "x-daily-used"),
+        "reset": _header_value(headers, "x-ratelimit-reset", "x-rate-limit-reset", "ratelimit-reset", "x-ratelimit-reset-after", "retry-after"),
+        "window": _header_value(headers, "x-ratelimit-window", "x-rate-limit-window", "ratelimit-window"),
+    }
+
+    limit_i = _to_int_or_none(usage.get("limit"))
+    remaining_i = _to_int_or_none(usage.get("remaining"))
+    used_i = _to_int_or_none(usage.get("used"))
+    if used_i is None and limit_i is not None and remaining_i is not None:
+        usage["used"] = max(0, limit_i - remaining_i)
+
+    return {k: v for k, v in usage.items() if v not in (None, "", [])}
+
+
 async def _request_json_with_retry(session, method: str, url: str, return_headers: bool = False, **kwargs):
     for attempt in range(MAX_RETRIES + 1):
         try:
@@ -516,25 +557,73 @@ async def query_threatfox(session, ioc, ioc_type):
 
     url = "https://threatfox-api.abuse.ch/api/v1/"
     headers = {"Auth-Key": THREATFOX_API_KEY, "Content-Type": "application/json"}
-    payload = {"query": "search_ioc", "search_term": ioc, "exact_match": True}
+    parsed_url = urlparse(ioc) if ioc_type == "url" else None
+    candidates: List[str] = [ioc]
+    if ioc_type == "url" and parsed_url:
+        host = (parsed_url.hostname or "").strip()
+        if host:
+            candidates.append(host)
+        path_root = ioc.split("?", 1)[0].rstrip("/")
+        if path_root and path_root != ioc:
+            candidates.append(path_root)
+    elif ioc_type == "domain":
+        domain_norm = ioc.strip().rstrip(".").lower()
+        if domain_norm and domain_norm != ioc:
+            candidates.append(domain_norm)
 
-    status, data, request_error = await _request_json_with_retry(
-        session,
-        "POST",
-        url,
-        headers=headers,
-        json=payload,
-    )
-    if request_error:
-        return {"source": "threatfox", "matches": 0, "max_confidence": 0, "score": 0, "error": request_error}
-    if status == 401:
-        return {"source": "threatfox", "matches": 0, "max_confidence": 0, "score": 0, "error": "invalid_api_key"}
-    if status == 429:
-        return {"source": "threatfox", "matches": 0, "max_confidence": 0, "score": 0, "error": "rate_limited"}
-    if data.get("query_status") != "ok":
-        return {"source": "threatfox", "matches": 0, "max_confidence": 0, "score": 0, "error": data.get("query_status", "no_results")}
+    deduped_candidates: List[str] = []
+    seen_candidates = set()
+    for candidate in candidates:
+        key = candidate.strip().lower()
+        if not key or key in seen_candidates:
+            continue
+        seen_candidates.add(key)
+        deduped_candidates.append(candidate)
 
-    matches = data.get("data", []) or []
+    matches: List[Dict[str, Any]] = []
+    statuses: List[str] = []
+    for candidate in deduped_candidates:
+        for exact in (True, False):
+            payload = {"query": "search_ioc", "search_term": candidate, "exact_match": exact}
+            status, data, request_error = await _request_json_with_retry(
+                session,
+                "POST",
+                url,
+                headers=headers,
+                json=payload,
+            )
+
+            if request_error:
+                return {"source": "threatfox", "matches": 0, "max_confidence": 0, "score": 0, "error": request_error}
+            if status == 401:
+                return {"source": "threatfox", "matches": 0, "max_confidence": 0, "score": 0, "error": "invalid_api_key"}
+            if status == 429:
+                return {"source": "threatfox", "matches": 0, "max_confidence": 0, "score": 0, "error": "rate_limited"}
+
+            query_status = str(data.get("query_status") or "").lower()
+            if query_status == "ok":
+                candidate_matches = data.get("data", []) or []
+                if candidate_matches:
+                    matches = candidate_matches
+                    break
+
+            if query_status:
+                statuses.append(f"{candidate}|exact={str(exact).lower()}:{query_status}")
+            else:
+                statuses.append(f"{candidate}|exact={str(exact).lower()}:unknown")
+
+            # Do not run non-exact immediately after an exact error for hash IOCs.
+            if ioc_type == "hash" and exact:
+                break
+        if matches:
+            break
+
+    if not matches:
+        out = {"source": "threatfox", "matches": 0, "max_confidence": 0, "score": 0, "error": "no_result"}
+        if statuses:
+            out["attempts"] = statuses[:6]
+        return out
+
     max_confidence = max((match.get("confidence_level", 0) or 0) for match in matches) if matches else 0
     score = round(min(max_confidence / 5, 20)) if matches else 0
 
@@ -1106,25 +1195,42 @@ async def query_silentpush(session, ioc, ioc_type):
     url = f"{SILENTPUSH_API_BASE_URL}{endpoint}"
     headers = {"X-API-KEY": SILENTPUSH_API_KEY}
 
-    status, data, request_error = await _request_json_with_retry(
+    status, data, request_error, response_headers = await _request_json_with_retry(
         session,
         "GET",
         url,
         headers=headers,
+        return_headers=True,
     )
+    api_usage = _extract_api_usage(response_headers)
     if request_error:
-        return {"source": "silentpush", "is_listed": False, "score": 0, "error": request_error}
+        out = {"source": "silentpush", "is_listed": False, "score": 0, "error": request_error}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 401:
-        return {"source": "silentpush", "is_listed": False, "score": 0, "error": "invalid_api_key"}
+        out = {"source": "silentpush", "is_listed": False, "score": 0, "error": "invalid_api_key"}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 403:
-        return {"source": "silentpush", "is_listed": False, "score": 0, "error": "forbidden"}
+        out = {"source": "silentpush", "is_listed": False, "score": 0, "error": "forbidden"}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 429:
-        return {"source": "silentpush", "is_listed": False, "score": 0, "error": "rate_limited"}
+        out = {"source": "silentpush", "is_listed": False, "score": 0, "error": "rate_limited"}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 404:
-        return {"source": "silentpush", "is_listed": False, "score": 0, "error": "not_found"}
+        out = {"source": "silentpush", "is_listed": False, "score": 0, "error": "not_found"}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status in {400, 422}:
         detail = data.get("error") or data.get("detail") or "invalid_query"
-        return {
+        out = {
             "source": "silentpush",
             "is_listed": False,
             "score": 0,
@@ -1132,6 +1238,9 @@ async def query_silentpush(session, ioc, ioc_type):
             "error_detail": detail,
             "hint": "Silent Push rejected this request. Confirm SILENTPUSH_API_KEY is a valid Explore API key and the IOC format is supported.",
         }
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
 
     payload = data.get("response") if isinstance(data, dict) else {}
     if not isinstance(payload, dict):
@@ -1558,7 +1667,7 @@ async def query_silentpush(session, ioc, ioc_type):
         if vals:
             context[output_key] = vals[0]
 
-    return {
+    out = {
         "source": "silentpush",
         "endpoint": endpoint,
         "query": indicator,
@@ -1571,6 +1680,9 @@ async def query_silentpush(session, ioc, ioc_type):
         "score": score,
         **context,
     }
+    if api_usage:
+        out["api_usage"] = api_usage
+    return out
 
 
 async def query_spur(session, ioc, ioc_type):
@@ -1596,25 +1708,47 @@ async def query_spur(session, ioc, ioc_type):
         params=params or None,
         return_headers=True,
     )
+    api_usage = _extract_api_usage(response_headers)
     if request_error:
-        return {"source": "spur", "score": 0, "error": request_error}
+        out = {"source": "spur", "score": 0, "error": request_error}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 401:
-        return {"source": "spur", "score": 0, "error": "invalid_api_key"}
+        out = {"source": "spur", "score": 0, "error": "invalid_api_key"}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 403:
-        return {
+        out = {
             "source": "spur",
             "score": 0,
             "error": "no_context_api_access",
             "hint": "Token is valid but does not include Context API access.",
         }
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 429:
-        return {"source": "spur", "score": 0, "error": "rate_limited"}
+        out = {"source": "spur", "score": 0, "error": "rate_limited"}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 400:
-        return {"source": "spur", "score": 0, "error": "invalid_query"}
+        out = {"source": "spur", "score": 0, "error": "invalid_query"}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 500:
-        return {"source": "spur", "score": 0, "error": "http_500"}
+        out = {"source": "spur", "score": 0, "error": "http_500"}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status and status >= 400:
-        return {"source": "spur", "score": 0, "error": f"http_{status}"}
+        out = {"source": "spur", "score": 0, "error": f"http_{status}"}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
 
     infrastructure = str(data.get("infrastructure", "") or "")
     risks = [str(r) for r in (data.get("risks") or []) if r]
@@ -1696,6 +1830,8 @@ async def query_spur(session, ioc, ioc_type):
         "tunnel_tags": sorted(tunnel_tags)[:10],
         "mmgeo_enabled": SPUR_USE_MAXMIND_GEO,
     }
+    if api_usage:
+        result["api_usage"] = api_usage
     if spur_dt:
         result["query_dt"] = spur_dt
     if client_behaviors:
@@ -2013,6 +2149,7 @@ async def query_reversinglabs(session, ioc, ioc_type):
     status = None
     data = {}
     request_error = None
+    response_headers: Dict[str, Any] = {}
 
     # Try endpoint variants because Spectra deployments can differ on exact URL shape.
     attempts = []
@@ -2051,13 +2188,15 @@ async def query_reversinglabs(session, ioc, ioc_type):
     all_404 = True
     for method, ep, params in attempts:
         last_endpoint = ep
-        status, data, request_error = await _request_json_with_retry(
+        status, data, request_error, headers_out = await _request_json_with_retry(
             session,
             method,
             f"{RL_SPECTRA_BASE_URL}{ep}",
             headers=headers,
             params=params,
+            return_headers=True,
         )
+        response_headers = headers_out or response_headers
         endpoint = ep
 
         if request_error:
@@ -2071,26 +2210,49 @@ async def query_reversinglabs(session, ioc, ioc_type):
         break
 
     if all_404:
-        return {
+        out = {
             "source": "reversinglabs",
             "score": 0,
             "error": "not_found",
             "endpoint": last_endpoint,
             "hint": "No supported Network Threat Intel endpoint variant was found on this Spectra instance.",
         }
+        api_usage = _extract_api_usage(response_headers)
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
 
+    api_usage = _extract_api_usage(response_headers)
     if request_error:
-        return {"source": "reversinglabs", "score": 0, "error": request_error, "endpoint": endpoint}
+        out = {"source": "reversinglabs", "score": 0, "error": request_error, "endpoint": endpoint}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 401:
-        return {"source": "reversinglabs", "score": 0, "error": "invalid_api_key", "endpoint": endpoint}
+        out = {"source": "reversinglabs", "score": 0, "error": "invalid_api_key", "endpoint": endpoint}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 403:
-        return {"source": "reversinglabs", "score": 0, "error": "forbidden", "endpoint": endpoint}
+        out = {"source": "reversinglabs", "score": 0, "error": "forbidden", "endpoint": endpoint}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 404:
-        return {"source": "reversinglabs", "score": 0, "error": "not_found", "endpoint": endpoint}
+        out = {"source": "reversinglabs", "score": 0, "error": "not_found", "endpoint": endpoint}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status == 429:
-        return {"source": "reversinglabs", "score": 0, "error": "rate_limited", "endpoint": endpoint}
+        out = {"source": "reversinglabs", "score": 0, "error": "rate_limited", "endpoint": endpoint}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
     if status and status >= 400:
-        return {"source": "reversinglabs", "score": 0, "error": f"http_{status}", "endpoint": endpoint}
+        out = {"source": "reversinglabs", "score": 0, "error": f"http_{status}", "endpoint": endpoint}
+        if api_usage:
+            out["api_usage"] = api_usage
+        return out
 
     normalized = data if isinstance(data, dict) else {"items": data, "count": len(data) if isinstance(data, list) else 0}
     signal = _rl_extract_signal(normalized)
@@ -2123,7 +2285,7 @@ async def query_reversinglabs(session, ioc, ioc_type):
             else:
                 related_downloads = summary
 
-    return {
+    out = {
         "source": "reversinglabs",
         "endpoint": endpoint,
         "classification": signal.get("classification"),
@@ -2157,6 +2319,9 @@ async def query_reversinglabs(session, ioc, ioc_type):
         "downloaded_files_sample": related_downloads.get("sample", []),
         "score": signal.get("score", 0),
     }
+    if api_usage:
+        out["api_usage"] = api_usage
+    return out
 
 
 # ----------------------------
