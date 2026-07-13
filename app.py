@@ -154,14 +154,20 @@ SOURCE_DISPLAY = {
 }
 
 PROVIDER_OPTIONS = [
+    ("reversinglabs", "ReversingLabs", False),
+    ("spur", "Spur", True),
+    ("silentpush", "Silent Push", False),
     ("virustotal", "VirusTotal", False),
     ("alienvault", "AlienVault OTX", False),
     ("threatfox", "ThreatFox", False),
     ("abuseipdb", "AbuseIPDB", True),
-    ("silentpush", "Silent Push", False),
-    ("spur", "Spur", True),
-    ("reversinglabs", "ReversingLabs", False),
 ]
+
+DEFAULT_ENABLED_SOURCES = {
+    "reversinglabs",
+    "spur",
+    "silentpush",
+}
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def api_health() -> dict:
@@ -171,13 +177,13 @@ def api_health() -> dict:
     st.session_state["spur_status"] = spur_status
     st.session_state["rl_status"] = rl_status
     return {
+        "ReversingLabs": bool(rl_status.get("active")),
+        "Spur": bool(spur_status.get("active")),
+        "Silent Push": bool(tl.SILENTPUSH_API_KEY),
         "VirusTotal": bool(tl.VT_API_KEY),
         "AlienVault OTX": bool(tl.OTX_API_KEY),
         "AbuseIPDB":  bool(tl.ABUSE_API_KEY),
         "ThreatFox":  bool(tl.THREATFOX_API_KEY),
-        "Silent Push": bool(tl.SILENTPUSH_API_KEY),
-        "Spur": bool(spur_status.get("active")),
-        "ReversingLabs": bool(rl_status.get("active")),
     }
 
 
@@ -268,14 +274,17 @@ def _render_api_usage_indicator(src: dict, provider_label: str) -> None:
         st.caption(f"{provider_label} did not return usage-limit headers for this request.")
 
 
+def _render_unavailable_api_usage_indicator(provider_label: str, reason: str) -> None:
+    st.markdown("**API usage:**")
+    st.caption(f"{provider_label}: {reason}")
+
+
 def _labelize_reversinglabs_key(key: str) -> str:
     text = str(key).replace("_", " ").replace(".", " > ")
     return text[:1].upper() + text[1:] if text else text
 
 
 def _render_reversinglabs_source(src: dict) -> None:
-    _render_api_usage_indicator(src, "ReversingLabs")
-
     if src.get("error"):
         st.warning(f"ReversingLabs error: {src.get('error')}")
         if src.get("hint"):
@@ -292,6 +301,25 @@ def _render_reversinglabs_source(src: dict) -> None:
     tp_clean = src.get("third_party_clean") or 0
     tp_total = src.get("third_party_total") or 0
     detection_ratio = src.get("third_party_detection_ratio")
+    confidence = src.get("confidence")
+    severity = src.get("severity")
+
+    first_seen = src.get("first_seen")
+    last_seen = src.get("last_seen")
+    status = src.get("status")
+    threat_name = src.get("threat_name")
+    malware_family = src.get("malware_family")
+    campaign = src.get("campaign")
+    threat_actor = src.get("threat_actor")
+
+    file_type = src.get("file_type")
+    mime_type = src.get("mime_type")
+    file_size = src.get("file_size")
+
+    tags = src.get("tags") or []
+    categories = src.get("categories") or []
+    ttps = src.get("ttps") or []
+    cves = src.get("cves") or []
 
     endpoint = src.get("endpoint")
 
@@ -310,6 +338,12 @@ def _render_reversinglabs_source(src: dict) -> None:
     c7.metric("3P Total", _fmt_reversinglabs_value(tp_total))
     c8.metric("3P Detect Ratio", _fmt_reversinglabs_value(detection_ratio))
 
+    extra1, extra2, extra3, extra4 = st.columns(4)
+    extra1.metric("Confidence", _fmt_reversinglabs_value(confidence))
+    extra2.metric("Severity", _fmt_reversinglabs_value(severity))
+    extra3.metric("First Seen", _fmt_reversinglabs_value(first_seen))
+    extra4.metric("Last Seen", _fmt_reversinglabs_value(last_seen))
+
     st.markdown("**Third-party reputation breakdown:**")
     if isinstance(detection_ratio, (int, float)) and isinstance(tp_total, int) and tp_total > 0:
         detected = int(tp_malicious) + int(tp_suspicious)
@@ -318,6 +352,28 @@ def _render_reversinglabs_source(src: dict) -> None:
     rep1.metric("Malicious", _fmt_reversinglabs_value(tp_malicious))
     rep2.metric("Suspicious", _fmt_reversinglabs_value(tp_suspicious))
     rep3.metric("Clean", _fmt_reversinglabs_value(tp_clean))
+
+    st.markdown("**Threat metadata:**")
+    meta1, meta2 = st.columns(2)
+    with meta1:
+        st.markdown(f"- **Status:** {_fmt_reversinglabs_value(status)}")
+        st.markdown(f"- **Threat Name:** {_fmt_reversinglabs_value(threat_name)}")
+        st.markdown(f"- **Malware Family:** {_fmt_reversinglabs_value(malware_family)}")
+        st.markdown(f"- **Campaign:** {_fmt_reversinglabs_value(campaign)}")
+        st.markdown(f"- **Threat Actor:** {_fmt_reversinglabs_value(threat_actor)}")
+    with meta2:
+        st.markdown(f"- **File Type:** {_fmt_reversinglabs_value(file_type)}")
+        st.markdown(f"- **MIME Type:** {_fmt_reversinglabs_value(mime_type)}")
+        st.markdown(f"- **File Size (bytes):** {_fmt_reversinglabs_value(file_size)}")
+
+    if tags:
+        st.markdown(f"- **Tags:** {', '.join(str(v) for v in tags[:10])}")
+    if categories:
+        st.markdown(f"- **Categories:** {', '.join(str(v) for v in categories[:10])}")
+    if ttps:
+        st.markdown(f"- **TTPs:** {', '.join(str(v) for v in ttps[:10])}")
+    if cves:
+        st.markdown(f"- **CVEs:** {', '.join(str(v) for v in cves[:10])}")
 
     st.markdown("**Network and ownership context:**")
     ctx_col1, ctx_col2 = st.columns(2)
@@ -340,6 +396,29 @@ def _render_reversinglabs_source(src: dict) -> None:
     a1.metric("Related URLs", _fmt_reversinglabs_value(src.get("related_urls_count")))
     a2.metric("Resolutions", _fmt_reversinglabs_value(src.get("resolutions_count")))
     a3.metric("Downloaded Files", _fmt_reversinglabs_value(src.get("downloaded_files_count")))
+
+    b1, b2, b3, b4, b5 = st.columns(5)
+    b1.metric("Related IPs", _fmt_reversinglabs_value(src.get("related_ip_count")))
+    b2.metric("Related Domains", _fmt_reversinglabs_value(src.get("related_domain_count")))
+    b3.metric("Payload URLs", _fmt_reversinglabs_value(src.get("related_url_payload_count")))
+    b4.metric("Related Hashes", _fmt_reversinglabs_value(src.get("related_hash_count")))
+    b5.metric("File Names", _fmt_reversinglabs_value(src.get("related_file_name_count")))
+
+    relation_samples = {
+        "Related IP sample": src.get("related_ip_sample") or [],
+        "Related domain sample": src.get("related_domain_sample") or [],
+        "Payload URL sample": src.get("related_url_payload_sample") or [],
+        "Related hash sample": src.get("related_hash_sample") or [],
+        "Related file-name sample": src.get("related_file_name_sample") or [],
+        "Related URLs endpoint sample": src.get("related_urls_sample") or [],
+        "Resolutions sample": src.get("resolutions_sample") or [],
+        "Downloaded files sample": src.get("downloaded_files_sample") or [],
+    }
+    compact_samples = {k: v for k, v in relation_samples.items() if v}
+    if compact_samples:
+        with st.expander("ReversingLabs related entity samples", expanded=False):
+            for label, values in compact_samples.items():
+                st.markdown(f"- **{label}:** {', '.join(str(x) for x in values[:10])}")
 
     highlights = src.get("highlights") or {}
     if highlights:
@@ -378,7 +457,13 @@ def _render_reversinglabs_source(src: dict) -> None:
 
 
 def _render_silentpush_source(src: dict) -> None:
-    _render_api_usage_indicator(src, "Silent Push")
+    if src.get("api_usage"):
+        _render_api_usage_indicator(src, "Silent Push")
+    else:
+        _render_unavailable_api_usage_indicator(
+            "Silent Push",
+            "usage/quota amounts are not exposed by the current Explore/API family responses.",
+        )
 
     if src.get("error"):
         st.warning(f"Silent Push error: {src.get('error')}")
@@ -496,6 +581,19 @@ def _source_by_name(detail: dict, source_name: str) -> dict:
         if src.get("source") == source_name:
             return src
     return {}
+
+
+def _order_sources_for_display(sources: list) -> list:
+    # Analyst-requested source order: ReversingLabs, Spur, Silent Push, then others.
+    priority = {
+        "reversinglabs": 0,
+        "spur": 1,
+        "silentpush": 2,
+    }
+    return sorted(
+        sources,
+        key=lambda s: (priority.get(str(s.get("source") or "").lower(), 99), str(s.get("source") or "")),
+    )
 
 
 def _collect_flagging_sources(detail: dict) -> list:
@@ -628,6 +726,24 @@ def _collect_quick_whois_summary(detail: dict) -> list:
     return summary_lines
 
 
+def _build_ioc_summary(detail: dict) -> str:
+    verdict = str(detail.get("verdict") or "Unknown")
+    score = detail.get("score", 0)
+    reasons = detail.get("reasons") or ([detail.get("reason")] if detail.get("reason") else [])
+    flagged_sources = _collect_flagging_sources(detail)
+
+    if reasons:
+        lead_reason = str(reasons[0]).strip().rstrip(".")
+        if lead_reason:
+            return f"{verdict} based on {lead_reason.lower()}."
+
+    if flagged_sources:
+        first_source = str(flagged_sources[0]).strip().rstrip(".")
+        return f"{verdict} with score {score}/100, primarily influenced by {first_source}."
+
+    return f"{verdict} with score {score}/100 based on the currently available provider evidence."
+
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🛡️ Threat Lookup")
@@ -641,7 +757,11 @@ with st.sidebar:
         label = f"{icon} {source_name}"
         if ip_only:
             label = f"{label} (IP-only)"
-        enabled = st.checkbox(label, value=True, key=f"source_enabled_{source_key}")
+        enabled = st.checkbox(
+            label,
+            value=source_key in DEFAULT_ENABLED_SOURCES,
+            key=f"source_enabled_{source_key}",
+        )
         if enabled:
             selected_sources.append(source_key)
 
@@ -773,13 +893,13 @@ if st.session_state.results is None:
 
     cols = st.columns(7)
     source_info = [
+        ("🧪", "ReversingLabs", "IPs · Domains · URLs · Hashes"),
+        ("🧭", "Spur",          "IPs only"),
+        ("🛰️", "Silent Push",   "IPs · Domains · URL hostnames"),
         ("🔬", "VirusTotal",    "IPs · Domains · URLs · Hashes"),
         ("👾", "AlienVault OTX","IPs · Domains · URLs · Hashes"),
         ("🕷️", "ThreatFox",     "IPs · Domains · URLs · Hashes"),
         ("🚨", "AbuseIPDB",     "IPs only"),
-        ("🛰️", "Silent Push",   "IPs · Domains · URL hostnames"),
-        ("🧭", "Spur",          "IPs only"),
-        ("🧪", "ReversingLabs", "IPs · Domains · URLs · Hashes"),
     ]
     health = api_health()
     for col, (icon, name, coverage) in zip(cols, source_info):
@@ -842,10 +962,9 @@ st.markdown('<div class="section-title">📋 Results</div>', unsafe_allow_html=T
 # Export buttons
 exp_col, json_col, _ = st.columns([1, 1, 5])
 with exp_col:
-    csv_buf = io.StringIO()
-    df.to_csv(csv_buf, index=False)
+    csv_output = tl.format_results(results, "csv")
     st.download_button(
-        "⬇️ Export CSV", csv_buf.getvalue(),
+        "⬇️ Export CSV", csv_output,
         "threat_results.csv", "text/csv", use_container_width=True
     )
 with json_col:
@@ -893,6 +1012,10 @@ detail = next((r for r in results if r and r.get("ioc") == selected_ioc), None)
 if detail:
     v = detail.get("verdict", "Benign")
     vs = VERDICT_STYLE.get(v, {"bg": "#f3f4f6", "fg": "#111827", "border": "#d1d5db"})
+    reasons = detail.get("reasons") or ([detail.get("reason")] if detail.get("reason") else [])
+    flagged_sources = _collect_flagging_sources(detail)
+    quick_whois = _collect_quick_whois_summary(detail)
+    summary_text = _build_ioc_summary(detail)
 
     # Verdict banner
     st.markdown(f"""
@@ -913,30 +1036,31 @@ if detail:
     </div>
     """, unsafe_allow_html=True)
 
-    # Reasons
-    reasons = detail.get("reasons") or ([detail.get("reason")] if detail.get("reason") else [])
+    st.markdown("**Assessment overview:**")
+    ov1, ov2, ov3 = st.columns(3)
+    ov1.metric("Final Verdict", str(v))
+    ov2.metric("Risk Score", f"{detail.get('score', 0)}/100")
+    ov3.metric("IOC Type", str((detail.get('type') or '—').upper()))
+
+    if flagged_sources:
+        st.markdown("- **Key contributing sources:**")
+        for line in flagged_sources[:5]:
+            st.markdown(f"  - {line}")
+
+    if quick_whois:
+        st.markdown("- **WHOIS / network context:**")
+        for line in quick_whois[:8]:
+            st.markdown(f"  - {line}")
+
     if reasons:
         st.markdown("**Assessment rationale:**")
         for r in reasons:
             st.markdown(f"- {r}")
 
-    if detail.get("verdict") == "Malicious":
-        flagged_sources = _collect_flagging_sources(detail)
-        if flagged_sources:
-            st.markdown("**Flagged by (all contributing sources):**")
-            for line in flagged_sources:
-                st.markdown(f"- {line}")
-
-        quick_whois = _collect_quick_whois_summary(detail)
-        if quick_whois:
-            st.markdown("**IOC context (WHOIS/network):**")
-            for line in quick_whois:
-                st.markdown(f"- {line}")
-
     st.markdown("---")
 
     # Per-source breakdown
-    for src in detail.get("sources", []):
+    for src in _order_sources_for_display(detail.get("sources", []) or []):
         src_name = src.get("source", "")
         has_error = bool(src.get("error"))
         icon = SOURCE_ICONS.get(src_name, "📡")

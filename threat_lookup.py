@@ -153,8 +153,6 @@ RETRY_BASE_DELAY = 0.6
 RETRY_JITTER = 0.25
 RETRY_MAX_DELAY = 1.5
 
-ALLOWLIST = {"8.8.8.8", "1.1.1.1", "google.com"}
-
 _SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
 _SHA1_RE   = re.compile(r'^[0-9a-fA-F]{40}$')
 _MD5_RE    = re.compile(r'^[0-9a-fA-F]{32}$')
@@ -726,9 +724,14 @@ def _silentpush_verdict_from_risk(risk_score: int) -> str:
 
 
 def _spur_verdict_from_signals(risks: List[str], tunnel_count: int, proxy_count: int) -> str:
-    if risks:
+    risk_text = " ".join(str(r or "") for r in risks).lower()
+    high_severity_markers = (
+        "botnet", "malware", "phish", "c2", "command_and_control",
+        "ransom", "exploit", "ddos", "bruteforce", "scanner",
+    )
+    if (risks and any(marker in risk_text for marker in high_severity_markers)) or len(risks) >= 3:
         return "Malicious"
-    if tunnel_count > 0 or proxy_count > 0:
+    if risks or tunnel_count > 0 or proxy_count > 0:
         return "Suspicious"
     return "Benign"
 
@@ -1933,7 +1936,8 @@ def _rl_leaf_items(value, prefix: str = "", depth: int = 0):
 
 
 def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
-    malicious_terms = ("malicious", "phishing", "malware", "c2", "botnet", "suspicious")
+    malicious_terms = ("malicious", "phishing", "malware", "c2", "botnet")
+    suspicious_terms = ("suspicious",)
     benign_terms = ("benign", "clean", "safe", "trusted")
 
     leaf_items = list(_rl_leaf_items(data))
@@ -1941,6 +1945,7 @@ def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
     threat_level = ""
     risk_score = None
     malicious_hits = 0
+    suspicious_hits = 0
     benign_hits = 0
 
     for key, val in leaf_items:
@@ -1964,6 +1969,8 @@ def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
 
         if any(term in text_l for term in malicious_terms):
             malicious_hits += 1
+        if any(term in text_l for term in suspicious_terms):
+            suspicious_hits += 1
         if any(term in text_l for term in benign_terms):
             benign_hits += 1
 
@@ -1993,9 +2000,25 @@ def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
     tp_total = int(tp_stats.get("total") or 0)
 
     threat_l = threat_level.lower()
-    if ("malicious" in cls_l) or ("high" in threat_l) or tp_malicious > 0 or malicious_hits > 0:
+    tp_mal_ratio = (tp_malicious / tp_total) if tp_total > 0 else 0.0
+    strong_third_party = (
+        tp_malicious >= 8
+        or (tp_total >= 40 and tp_malicious >= 5 and tp_mal_ratio >= 0.12)
+    )
+    risk_score_high = False
+    if risk_score is not None:
+        risk_score_high = (risk_score >= 0.8) if risk_score <= 1 else (risk_score >= 80)
+
+    if (
+        ("malicious" in cls_l)
+        or ("known_malicious" in cls_l)
+        or ("high" in threat_l)
+        or ("critical" in threat_l)
+        or strong_third_party
+        or risk_score_high
+    ):
         rl_verdict = "Malicious"
-    elif ("suspicious" in cls_l) or ("medium" in threat_l) or tp_suspicious > 0:
+    elif ("suspicious" in cls_l) or ("medium" in threat_l) or tp_suspicious > 0 or tp_malicious > 0 or suspicious_hits > 0:
         rl_verdict = "Suspicious"
     elif ("benign" in cls_l) or (tp_total > 0 and tp_malicious == 0 and tp_suspicious == 0 and tp_clean > 0):
         rl_verdict = "Benign"
@@ -2019,6 +2042,43 @@ def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
         "third_party_detection_ratio": detection_ratio,
         "score": min(20, max(0, score)),
     }
+
+
+def _rl_has_strong_malicious_evidence(result: Dict[str, Any]) -> bool:
+    cls_l = str(result.get("classification") or "").lower()
+    threat_l = str(result.get("threat_level") or "").lower()
+
+    try:
+        tp_malicious = int(result.get("third_party_malicious") or 0)
+    except Exception:
+        tp_malicious = 0
+
+    try:
+        tp_total = int(result.get("third_party_total") or 0)
+    except Exception:
+        tp_total = 0
+
+    risk_score = result.get("risk_score")
+    risk_score_high = False
+    try:
+        if risk_score is not None:
+            risk_value = float(risk_score)
+            risk_score_high = (risk_value >= 0.8) if risk_value <= 1 else (risk_value >= 80)
+    except Exception:
+        risk_score_high = False
+
+    if "malicious" in cls_l or "known_malicious" in cls_l:
+        return True
+    if "high" in threat_l or "critical" in threat_l:
+        return True
+    tp_mal_ratio = (tp_malicious / tp_total) if tp_total > 0 else 0.0
+    if tp_malicious >= 8:
+        return True
+    if tp_total >= 40 and tp_malicious >= 5 and tp_mal_ratio >= 0.12:
+        return True
+    if risk_score_high:
+        return True
+    return False
 
 
 def _rl_extract_collection_values(payload: Any) -> List[Any]:
@@ -2135,6 +2195,159 @@ def _rl_summarize_collection(payload: Any) -> Dict[str, Any]:
                     sample.append(str(value))
                     break
     return {"count": len(items), "sample": sample[:5]}
+
+
+def _rl_extract_additional_context(data: Dict[str, Any]) -> Dict[str, Any]:
+    leaf_items = list(_rl_leaf_items(data))
+
+    single_value_aliases = {
+        "confidence": ("confidence", "trust", "certainty"),
+        "severity": ("severity", "severity_label"),
+        "status": ("status", "state"),
+        "threat_name": ("threat_name", "threat", "malware_name"),
+        "malware_family": ("family", "malware_family"),
+        "campaign": ("campaign",),
+        "threat_actor": ("actor", "threat_actor", "apt", "group"),
+        "file_type": ("file_type", "type_description", "file_kind", "file_format"),
+        "mime_type": ("mime", "mime_type", "content_type"),
+        "file_size": ("file_size", "size", "filesize"),
+        "first_seen": ("first_seen", "first_observed", "seen_first", "discovered"),
+        "last_seen": ("last_seen", "last_observed", "seen_last"),
+        "sha256": ("sha256",),
+        "sha1": ("sha1",),
+        "md5": ("md5",),
+    }
+    list_value_aliases = {
+        "tags": ("tag",),
+        "categories": ("category", "classification", "threat_type"),
+        "ttps": ("mitre", "attack", "technique", "tactic"),
+        "cves": ("cve", "vulnerability"),
+    }
+
+    context: Dict[str, Any] = {}
+    list_values: Dict[str, List[str]] = {key: [] for key in list_value_aliases}
+    cve_pattern = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
+
+    for key, val in leaf_items:
+        if isinstance(val, (dict, list, tuple, set)):
+            continue
+        text = str(val).strip()
+        if not text:
+            continue
+
+        key_l = key.lower()
+        normalized_key = key_l.replace("[", ".").replace("]", "")
+
+        for output_key, aliases in single_value_aliases.items():
+            if output_key in context:
+                continue
+            if any(
+                normalized_key.endswith(alias)
+                or f".{alias}." in f".{normalized_key}."
+                for alias in aliases
+            ):
+                context[output_key] = text
+                break
+
+        for output_key, aliases in list_value_aliases.items():
+            if any(
+                normalized_key.endswith(alias)
+                or f".{alias}." in f".{normalized_key}."
+                for alias in aliases
+            ):
+                if output_key == "cves":
+                    matches = cve_pattern.findall(text)
+                    if matches:
+                        for match in matches:
+                            upper = match.upper()
+                            if upper not in list_values[output_key]:
+                                list_values[output_key].append(upper)
+                        continue
+                if text not in list_values[output_key]:
+                    list_values[output_key].append(text)
+
+        cve_hits = cve_pattern.findall(text)
+        for match in cve_hits:
+            upper = match.upper()
+            if upper not in list_values["cves"]:
+                list_values["cves"].append(upper)
+
+    for output_key, values in list_values.items():
+        if values:
+            context[output_key] = values[:15]
+
+    size_val = context.get("file_size")
+    if isinstance(size_val, str):
+        try:
+            context["file_size"] = int(float(size_val))
+        except ValueError:
+            pass
+
+    return context
+
+
+def _rl_extract_related_entities(data: Dict[str, Any]) -> Dict[str, Any]:
+    related_ips: List[str] = []
+    related_domains: List[str] = []
+    related_urls: List[str] = []
+    related_hashes: List[str] = []
+    related_files: List[str] = []
+
+    domain_like_re = re.compile(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
+
+    for key, val in _rl_leaf_items(data):
+        if isinstance(val, (dict, list, tuple, set)):
+            continue
+        text = str(val).strip()
+        if not text:
+            continue
+
+        key_l = key.lower()
+
+        is_ip = False
+        try:
+            ipaddress.ip_address(text)
+            is_ip = True
+        except ValueError:
+            is_ip = False
+
+        if is_ip:
+            if text not in related_ips:
+                related_ips.append(text)
+            continue
+
+        if _URL_RE.match(text):
+            if text not in related_urls:
+                related_urls.append(text)
+            continue
+
+        lower_text = text.lower()
+        if _SHA256_RE.match(text) or _SHA1_RE.match(text) or _MD5_RE.match(text):
+            if lower_text not in [h.lower() for h in related_hashes]:
+                related_hashes.append(text)
+            continue
+
+        if "/" not in text and " " not in text and domain_like_re.match(text):
+            if text not in related_domains:
+                related_domains.append(text)
+            continue
+
+        if any(token in key_l for token in ("filename", "file_name", "name", "path", "artifact")):
+            if len(text) <= 260 and text not in related_files:
+                related_files.append(text)
+
+    return {
+        "related_ip_count": len(related_ips),
+        "related_ip_sample": related_ips[:10],
+        "related_domain_count": len(related_domains),
+        "related_domain_sample": related_domains[:10],
+        "related_url_payload_count": len(related_urls),
+        "related_url_payload_sample": related_urls[:10],
+        "related_hash_count": len(related_hashes),
+        "related_hash_sample": related_hashes[:10],
+        "related_file_name_count": len(related_files),
+        "related_file_name_sample": related_files[:10],
+    }
 
 
 async def query_reversinglabs(session, ioc, ioc_type):
@@ -2258,6 +2471,8 @@ async def query_reversinglabs(session, ioc, ioc_type):
     signal = _rl_extract_signal(normalized)
     highlights = _rl_extract_highlights(normalized)
     whois_context = _rl_extract_whois_context(normalized)
+    additional_context = _rl_extract_additional_context(normalized)
+    related_entities = _rl_extract_related_entities(normalized)
 
     # Best-effort additional context for IP IOCs.
     related_urls = {"count": 0, "sample": []}
@@ -2298,6 +2513,25 @@ async def query_reversinglabs(session, ioc, ioc_type):
         "third_party_clean": signal.get("third_party_clean"),
         "third_party_total": signal.get("third_party_total"),
         "third_party_detection_ratio": signal.get("third_party_detection_ratio"),
+        "confidence": additional_context.get("confidence"),
+        "severity": additional_context.get("severity"),
+        "status": additional_context.get("status"),
+        "threat_name": additional_context.get("threat_name"),
+        "malware_family": additional_context.get("malware_family"),
+        "campaign": additional_context.get("campaign"),
+        "threat_actor": additional_context.get("threat_actor"),
+        "file_type": additional_context.get("file_type"),
+        "mime_type": additional_context.get("mime_type"),
+        "file_size": additional_context.get("file_size"),
+        "first_seen": additional_context.get("first_seen"),
+        "last_seen": additional_context.get("last_seen"),
+        "sha256": additional_context.get("sha256"),
+        "sha1": additional_context.get("sha1"),
+        "md5": additional_context.get("md5"),
+        "tags": additional_context.get("tags", []),
+        "categories": additional_context.get("categories", []),
+        "ttps": additional_context.get("ttps", []),
+        "cves": additional_context.get("cves", []),
         "highlights": highlights,
         "registrar": whois_context.get("registrar"),
         "registrant": whois_context.get("registrant"),
@@ -2317,6 +2551,16 @@ async def query_reversinglabs(session, ioc, ioc_type):
         "resolutions_sample": related_resolutions.get("sample", []),
         "downloaded_files_count": related_downloads.get("count", 0),
         "downloaded_files_sample": related_downloads.get("sample", []),
+        "related_ip_count": related_entities.get("related_ip_count", 0),
+        "related_ip_sample": related_entities.get("related_ip_sample", []),
+        "related_domain_count": related_entities.get("related_domain_count", 0),
+        "related_domain_sample": related_entities.get("related_domain_sample", []),
+        "related_url_payload_count": related_entities.get("related_url_payload_count", 0),
+        "related_url_payload_sample": related_entities.get("related_url_payload_sample", []),
+        "related_hash_count": related_entities.get("related_hash_count", 0),
+        "related_hash_sample": related_entities.get("related_hash_sample", []),
+        "related_file_name_count": related_entities.get("related_file_name_count", 0),
+        "related_file_name_sample": related_entities.get("related_file_name_sample", []),
         "score": signal.get("score", 0),
     }
     if api_usage:
@@ -2423,8 +2667,9 @@ def early_exit(results):
             return True, f"Silent Push returned high-severity malicious indicators (risk score {r.get('sp_risk_score')}/100)"
         if r["source"] == "spur" and r.get("spur_verdict") == "Malicious":
             risk_count = len(r.get("risks") or [])
-            return True, f"Spur returned malicious-class risk indicators ({risk_count} risk signal(s))"
-        if r["source"] == "reversinglabs" and r.get("rl_verdict") == "Malicious":
+            if int(r.get("score") or 0) >= 12:
+                return True, f"Spur returned malicious-class risk indicators ({risk_count} risk signal(s))"
+        if r["source"] == "reversinglabs" and r.get("rl_verdict") == "Malicious" and _rl_has_strong_malicious_evidence(r):
             return True, "ReversingLabs returned a malicious verdict"
         if r["source"] == "abuseipdb" and r.get("abuse_score", 0) > 90:
             return True, f"Very high AbuseIPDB confidence score ({r['abuse_score']}/100)"
@@ -2443,9 +2688,6 @@ async def analyze_with_session(
 ):
     start = time.time()
     ioc = ioc.strip()
-
-    if ioc in ALLOWLIST:
-        return {"ioc": ioc, "verdict": "Benign", "score": 0, "reason": "Allowlisted", "time_taken": 0}
 
     ioc_type = detect_type(ioc)
 
@@ -2600,20 +2842,8 @@ def _prepare_iocs(iocs: List[str], max_iocs: int = 0) -> List[str]:
 # ----------------------------
 EXPORT_FIELDNAMES = [
     "ioc", "type", "verdict", "score", "time_taken", "reason", "reasons",
-    "source_count", "source_errors",
-    "vt_malicious", "vt_suspicious", "vt_detected_by", "vt_country", "vt_continent",
-    "vt_asn", "vt_as_owner", "vt_network", "vt_tags", "vt_last_analysed",
-    "vt_community_reputation", "vt_community_votes", "vt_error",
-    "otx_pulses", "otx_country_name", "otx_city", "otx_asn", "otx_pulse_names",
-    "otx_malware_families", "otx_tags", "otx_targeted_countries", "otx_attack_ids",
-    "otx_adversaries", "otx_industries_targeted", "otx_error",
-    "abuse_score", "abuse_total_reports", "abuse_distinct_reporters", "abuse_country",
-    "abuse_isp", "abuse_domain", "abuse_usage_type", "abuse_is_tor", "abuse_is_whitelisted",
-    "abuse_last_reported_at", "abuse_hostnames", "abuse_error",
-    "threatfox_matches", "threatfox_ioc_types", "threatfox_max_confidence",
-    "threatfox_malware_families", "threatfox_threat_types", "threatfox_tags",
-    "threatfox_first_seen", "threatfox_last_seen", "threatfox_references",
-    "threatfox_malware_aliases", "threatfox_error",
+    "summary_short", "key_source_summary", "whois_summary", "location_summary",
+    "source_count",
     "silentpush_query", "silentpush_query_type", "silentpush_data_source", "silentpush_endpoint", "silentpush_sp_risk_score",
     "silentpush_sp_verdict", "silentpush_sp_risk_score_decider", "silentpush_answer", "silentpush_answer_asn",
     "silentpush_answer_as_name", "silentpush_country_code", "silentpush_subnet", "silentpush_asn_reputation",
@@ -2639,11 +2869,17 @@ EXPORT_FIELDNAMES = [
     "spur_client_count", "spur_client_countries", "spur_client_spread", "spur_client_types",
     "spur_tunnel_types", "spur_tunnel_operators", "spur_tunnel_tags", "spur_error",
     "rl_endpoint", "rl_verdict", "rl_classification", "rl_threat_level", "rl_risk_score", "rl_malicious_signals",
+    "rl_confidence", "rl_severity", "rl_status", "rl_threat_name", "rl_malware_family", "rl_campaign", "rl_threat_actor",
+    "rl_file_type", "rl_mime_type", "rl_file_size", "rl_first_seen", "rl_last_seen", "rl_sha256", "rl_sha1", "rl_md5",
     "rl_registrar", "rl_registrant", "rl_organization", "rl_country", "rl_created", "rl_updated",
     "rl_expires", "rl_asn", "rl_as_owner", "rl_network", "rl_registry", "rl_nameservers",
     "rl_third_party_malicious", "rl_third_party_suspicious", "rl_third_party_clean", "rl_third_party_total", "rl_third_party_detection_ratio",
+    "rl_tags", "rl_categories", "rl_ttps", "rl_cves",
     "rl_highlights", "rl_related_urls_count", "rl_related_urls_sample",
     "rl_resolutions_count", "rl_resolutions_sample",
+    "rl_related_ip_count", "rl_related_ip_sample", "rl_related_domain_count", "rl_related_domain_sample",
+    "rl_related_url_payload_count", "rl_related_url_payload_sample", "rl_related_hash_count", "rl_related_hash_sample",
+    "rl_related_file_name_count", "rl_related_file_name_sample",
     "rl_downloaded_files_count", "rl_downloaded_files_sample", "rl_error",
     "sources_json",
 ]
@@ -2659,6 +2895,100 @@ def _join_export_value(value):
 
 def _src_by_name(sources, name):
     return next((s for s in sources if s.get("source") == name), {})
+
+
+def _first_non_empty(*values):
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _build_export_key_source_summary(vt, otx, abuse, tf, sp, spur, rl) -> str:
+    parts = []
+
+    if rl.get("rl_verdict") not in (None, "", "Unknown"):
+        parts.append(f"ReversingLabs={rl.get('rl_verdict')}")
+    if spur.get("spur_verdict") not in (None, "", "Benign", "Unknown"):
+        parts.append(f"Spur={spur.get('spur_verdict')}")
+    if sp.get("sp_verdict") not in (None, "", "Benign", "Unknown"):
+        parts.append(f"SilentPush={sp.get('sp_verdict')}:{sp.get('sp_risk_score', 0)}/100")
+
+    return "; ".join(parts[:8])
+
+
+def _build_export_whois_summary(sp, rl) -> str:
+    parts = []
+    owner = _first_non_empty(rl.get("organization"), rl.get("as_owner"), sp.get("as_org"))
+    registrar = _first_non_empty(rl.get("registrar"), sp.get("registrar"))
+    registrant = _first_non_empty(rl.get("registrant"), rl.get("organization"))
+    asn = _first_non_empty(rl.get("asn"), sp.get("asn_lookup"), sp.get("answer_asn"))
+    network = _first_non_empty(rl.get("network"), sp.get("subnet"))
+    created = _first_non_empty(rl.get("created"), sp.get("registration_date"))
+    updated = _first_non_empty(rl.get("updated"), sp.get("last_changed_date"))
+    expires = _first_non_empty(rl.get("expires"), sp.get("expiration_date"))
+    nameservers = _first_non_empty(rl.get("nameservers"), sp.get("nameservers"))
+
+    if owner is not None:
+        parts.append(f"owner={owner}")
+    if registrar is not None:
+        parts.append(f"registrar={registrar}")
+    if registrant is not None:
+        parts.append(f"registrant={registrant}")
+    if asn is not None:
+        parts.append(f"asn={asn}")
+    if network is not None:
+        parts.append(f"network={network}")
+    if created is not None:
+        parts.append(f"created={created}")
+    if updated is not None:
+        parts.append(f"updated={updated}")
+    if expires is not None:
+        parts.append(f"expires={expires}")
+    if isinstance(nameservers, list) and nameservers:
+        parts.append(f"nameservers={','.join(str(v) for v in nameservers[:4])}")
+
+    return "; ".join(parts)
+
+
+def _build_export_location_summary(sp, spur, rl) -> str:
+    parts = []
+    country = _first_non_empty(rl.get("country"), spur.get("country"), sp.get("country"), sp.get("country_code"))
+    city = _first_non_empty(spur.get("city"))
+    org = _first_non_empty(spur.get("organization"), spur.get("as_organization"), rl.get("organization"), rl.get("as_owner"))
+    subnet = _first_non_empty(rl.get("network"), sp.get("subnet"))
+
+    if country is not None:
+        parts.append(f"country={country}")
+    if city is not None:
+        parts.append(f"city={city}")
+    if org is not None:
+        parts.append(f"org={org}")
+    if subnet is not None:
+        parts.append(f"network={subnet}")
+
+    return "; ".join(parts)
+
+
+def _redact_export_reasons(reasons: list) -> list:
+    blocked_terms = (
+        "virustotal",
+        "vt:",
+        "alienvault",
+        "otx",
+        "abuseipdb",
+        "threatfox",
+    )
+    cleaned = []
+    for reason in reasons or []:
+        text = str(reason).strip()
+        if not text:
+            continue
+        lower = text.lower()
+        if any(term in lower for term in blocked_terms):
+            continue
+        cleaned.append(text)
+    return cleaned
 
 
 def _flatten_export_rows(rows):
@@ -2683,70 +3013,20 @@ def _flatten_export_rows(rows):
         spur = _src_by_name(sources, "spur")
         rl = _src_by_name(sources, "reversinglabs")
 
+        reason_list = _redact_export_reasons(row.get("reasons", []) or ([row.get("reason")] if row.get("reason") else []))
+        lead_reason = str(reason_list[0]).strip() if reason_list else ""
+        if lead_reason:
+            row_copy["summary_short"] = f"{row.get('verdict', 'Unknown')} with score {row.get('score', 0)}/100. {lead_reason}"
+        else:
+            row_copy["summary_short"] = f"{row.get('verdict', 'Unknown')} with score {row.get('score', 0)}/100."
+
+        row_copy["key_source_summary"] = _build_export_key_source_summary(vt, otx, abuse, tf, sp, spur, rl)
+        row_copy["whois_summary"] = _build_export_whois_summary(sp, rl)
+        row_copy["location_summary"] = _build_export_location_summary(sp, spur, rl)
+
         row_copy["source_count"] = len(sources)
-        row_copy["source_errors"] = "; ".join(
-            f"{s.get('source')}:{s.get('error')}" for s in sources if s.get("error")
-        )
-
-        row_copy.update({
-            "vt_malicious": vt.get("malicious"),
-            "vt_suspicious": vt.get("suspicious"),
-            "vt_detected_by": _join_export_value(vt.get("detected_by", [])),
-            "vt_country": vt.get("country"),
-            "vt_continent": vt.get("continent"),
-            "vt_asn": vt.get("asn"),
-            "vt_as_owner": vt.get("as_owner"),
-            "vt_network": vt.get("network"),
-            "vt_tags": _join_export_value(vt.get("tags", [])),
-            "vt_last_analysed": vt.get("last_analysed"),
-            "vt_community_reputation": vt.get("community_reputation"),
-            "vt_community_votes": _join_export_value(vt.get("community_votes", {})),
-            "vt_error": vt.get("error"),
-        })
-
-        row_copy.update({
-            "otx_pulses": otx.get("pulses"),
-            "otx_country_name": otx.get("country_name"),
-            "otx_city": otx.get("city"),
-            "otx_asn": otx.get("asn"),
-            "otx_pulse_names": _join_export_value(otx.get("pulse_names", [])),
-            "otx_malware_families": _join_export_value(otx.get("malware_families", [])),
-            "otx_tags": _join_export_value(otx.get("tags", [])),
-            "otx_targeted_countries": _join_export_value(otx.get("targeted_countries", [])),
-            "otx_attack_ids": _join_export_value(otx.get("attack_ids", [])),
-            "otx_adversaries": _join_export_value(otx.get("adversaries", [])),
-            "otx_industries_targeted": _join_export_value(otx.get("industries_targeted", [])),
-            "otx_error": otx.get("error"),
-        })
-
-        row_copy.update({
-            "abuse_score": abuse.get("abuse_score"),
-            "abuse_total_reports": abuse.get("total_reports"),
-            "abuse_distinct_reporters": abuse.get("distinct_reporters"),
-            "abuse_country": abuse.get("country"),
-            "abuse_isp": abuse.get("isp"),
-            "abuse_domain": abuse.get("domain"),
-            "abuse_usage_type": abuse.get("usage_type"),
-            "abuse_is_tor": abuse.get("is_tor"),
-            "abuse_is_whitelisted": abuse.get("is_whitelisted"),
-            "abuse_last_reported_at": abuse.get("last_reported_at"),
-            "abuse_hostnames": _join_export_value(abuse.get("hostnames", [])),
-            "abuse_error": abuse.get("error"),
-        })
-
-        row_copy.update({
-            "threatfox_matches": tf.get("matches"),
-            "threatfox_ioc_types": _join_export_value(tf.get("ioc_types", [])),
-            "threatfox_max_confidence": tf.get("max_confidence"),
-            "threatfox_malware_families": _join_export_value(tf.get("malware_families", [])),
-            "threatfox_threat_types": _join_export_value(tf.get("threat_types", [])),
-            "threatfox_tags": _join_export_value(tf.get("tags", [])),
-            "threatfox_first_seen": tf.get("first_seen"),
-            "threatfox_last_seen": tf.get("last_seen"),
-            "threatfox_references": _join_export_value(tf.get("references", [])),
-            "threatfox_malware_aliases": _join_export_value(tf.get("malware_aliases", [])),
-            "threatfox_error": tf.get("error"),
-        })
+        row_copy["reason"] = reason_list[0] if reason_list else row_copy["reason"]
+        row_copy["reasons"] = "; ".join(reason_list)
 
         row_copy.update({
             "silentpush_query": sp.get("query"),
@@ -2844,6 +3124,21 @@ def _flatten_export_rows(rows):
             "rl_threat_level": rl.get("threat_level"),
             "rl_risk_score": rl.get("risk_score"),
             "rl_malicious_signals": rl.get("malicious_signals"),
+            "rl_confidence": rl.get("confidence"),
+            "rl_severity": rl.get("severity"),
+            "rl_status": rl.get("status"),
+            "rl_threat_name": rl.get("threat_name"),
+            "rl_malware_family": rl.get("malware_family"),
+            "rl_campaign": rl.get("campaign"),
+            "rl_threat_actor": rl.get("threat_actor"),
+            "rl_file_type": rl.get("file_type"),
+            "rl_mime_type": rl.get("mime_type"),
+            "rl_file_size": rl.get("file_size"),
+            "rl_first_seen": rl.get("first_seen"),
+            "rl_last_seen": rl.get("last_seen"),
+            "rl_sha256": rl.get("sha256"),
+            "rl_sha1": rl.get("sha1"),
+            "rl_md5": rl.get("md5"),
             "rl_registrar": rl.get("registrar"),
             "rl_registrant": rl.get("registrant"),
             "rl_organization": rl.get("organization"),
@@ -2861,17 +3156,30 @@ def _flatten_export_rows(rows):
             "rl_third_party_clean": rl.get("third_party_clean"),
             "rl_third_party_total": rl.get("third_party_total"),
             "rl_third_party_detection_ratio": rl.get("third_party_detection_ratio"),
+            "rl_tags": _join_export_value(rl.get("tags", [])),
+            "rl_categories": _join_export_value(rl.get("categories", [])),
+            "rl_ttps": _join_export_value(rl.get("ttps", [])),
+            "rl_cves": _join_export_value(rl.get("cves", [])),
             "rl_highlights": _join_export_value(rl.get("highlights", {})),
             "rl_related_urls_count": rl.get("related_urls_count"),
             "rl_related_urls_sample": _join_export_value(rl.get("related_urls_sample", [])),
             "rl_resolutions_count": rl.get("resolutions_count"),
             "rl_resolutions_sample": _join_export_value(rl.get("resolutions_sample", [])),
+            "rl_related_ip_count": rl.get("related_ip_count"),
+            "rl_related_ip_sample": _join_export_value(rl.get("related_ip_sample", [])),
+            "rl_related_domain_count": rl.get("related_domain_count"),
+            "rl_related_domain_sample": _join_export_value(rl.get("related_domain_sample", [])),
+            "rl_related_url_payload_count": rl.get("related_url_payload_count"),
+            "rl_related_url_payload_sample": _join_export_value(rl.get("related_url_payload_sample", [])),
+            "rl_related_hash_count": rl.get("related_hash_count"),
+            "rl_related_hash_sample": _join_export_value(rl.get("related_hash_sample", [])),
+            "rl_related_file_name_count": rl.get("related_file_name_count"),
+            "rl_related_file_name_sample": _join_export_value(rl.get("related_file_name_sample", [])),
             "rl_downloaded_files_count": rl.get("downloaded_files_count"),
             "rl_downloaded_files_sample": _join_export_value(rl.get("downloaded_files_sample", [])),
             "rl_error": rl.get("error"),
         })
 
-        row_copy["sources_json"] = json.dumps(sources, separators=(",", ":"))
         flat_rows.append(row_copy)
     return flat_rows
 

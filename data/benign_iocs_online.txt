@@ -1,0 +1,12 @@
+﻿# Sources:
+# https://developers.google.com/speed/public-dns/docs/using
+# https://developers.cloudflare.com/1.1.1.1/ip-addresses/
+# https://www.quad9.net/service/service-addresses-and-features
+8.8.8.8
+8.8.4.4
+1.1.1.1
+1.0.0.1
+9.9.9.9
+149.112.112.112
+9.9.9.10
+149.112.112.10

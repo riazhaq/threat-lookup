@@ -33,3 +33,5 @@ outputs/*.xlsx
 
 # Keep sample IOC inputs under data/
 # (do not ignore data/)
+data/*results*.json
+data/*_results*.json

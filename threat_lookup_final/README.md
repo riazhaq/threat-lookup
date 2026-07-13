@@ -1,6 +1,11 @@
 # Threat Lookup
 
-Threat Lookup is a Streamlit-based IOC triage dashboard that checks indicators against multiple threat intelligence providers and returns a scored verdict with analyst-friendly evidence.
+Threat Lookup is a multi-source IOC triage tool that includes:
+
+- A Streamlit dashboard for analyst workflows
+- A CLI for single IOC and batch analysis
+
+It enriches indicators from multiple threat intelligence providers, computes a composite risk score, and returns a verdict with source-level evidence.
 
 ## Features
 - Multi-source IOC enrichment from:
@@ -17,6 +22,11 @@ Threat Lookup is a Streamlit-based IOC triage dashboard that checks indicators a
   - Spur Context API (for IP indicators)
   - ReversingLabs Spectra Analyze (for IPs, domains, URLs, and hashes)
     - Best-effort WHOIS / registration context surfacing when returned by the Spectra instance
+- IOC types supported:
+  - IP
+  - Domain
+  - URL
+  - Hash (MD5, SHA1, SHA256)
 - Weighted scoring with clear verdict classes:
   - Malicious
   - Suspicious
@@ -24,10 +34,18 @@ Threat Lookup is a Streamlit-based IOC triage dashboard that checks indicators a
   - Benign
 - Fast concurrent batch processing with configurable workers and pacing.
 - Streamlit dashboard with:
+  - Source toggles per provider
+  - API health indicators in sidebar and landing view
   - Upload or paste IOC input
   - Clickable result rows and detail pane
   - Per-source evidence display
+  - KPI cards and summary charts
   - CSV and JSON export
+- CLI with:
+  - Single IOC analysis or file-based batch mode
+  - TXT and Excel input support
+  - JSON, CSV, and XLSX output
+  - Batch size, cooldown, deduplication, and max IOC controls
 
 ## Project Structure
 - app.py: Streamlit dashboard.
@@ -37,9 +55,10 @@ Threat Lookup is a Streamlit-based IOC triage dashboard that checks indicators a
 - setup.ps1: Environment setup script.
 - requirements.txt: Python dependencies.
 - data/: Sample IOC input files.
-- outputs/: Generated benchmark and result files.
 - docs/: Setup guide, UML/DFD, and SDLC.
-- threat_lookup_final/: Curated package for supervisor handoff.
+- .env.example: Template for environment configuration.
+
+Note: outputs are generated when you export or run CLI commands with output paths.
 
 ## Requirements
 - Windows 10 or 11
@@ -48,9 +67,9 @@ Threat Lookup is a Streamlit-based IOC triage dashboard that checks indicators a
 - API keys for intelligence providers
 
 ## Quick Start
-1. Run setup:
+1. Run setup (creates .venv and installs dependencies):
    - PowerShell: `./setup.ps1`
-2. Configure environment variables in `.env` (or copy from `.env.example`).
+2. Copy `.env.example` to `.env` and add API keys.
 3. Launch dashboard:
    - Double-click `launch_dashboard.bat`
    - Or run: `python run_gui.py`
@@ -68,21 +87,27 @@ Required core keys:
 - RL_SPECTRA_BASE_URL
 - RL_SPECTRA_TOKEN
 
-Optional Silent Push setting:
-- SILENTPUSH_API_BASE_URL=https://api.silentpush.com/api/v1/merge-api
-- SILENTPUSH_META_API_BASE_URL=https://api.silentpush.com/api/v1/meta-api
-- SILENTPUSH_V2_API_BASE_URL=https://api.silentpush.com/api/v2
-- SILENTPUSH_MAX_ENRICH_CALLS=2
-- SILENTPUSH_MAX_NON_EXPLORE_CALLS=4
-- SILENTPUSH_ENABLE_CONTEXT_GRAPH_SEARCH=true
-- SILENTPUSH_ENABLE_ENRICH_INDICATOR=true
-- SILENTPUSH_ENABLE_LIVE_SCAN=true
-- SILENTPUSH_ENABLE_THREAT_RANKING=true
-- SILENTPUSH_VERBOSE_NON_EXPLORE_ERRORS=false
-- SILENTPUSH_VERBOSE_EXPLORE_ERRORS=false
-- SILENTPUSH_SPQL_PAYLOAD_MODE=auto
-- SILENTPUSH_SPQL_QUERY_TEMPLATE=SELECT * FROM scandata WHERE query='{indicator}' LIMIT 25
-- SILENTPUSH_SPQL_QUERY_TEMPLATE_ALT=SELECT * FROM scandata WHERE indicator='{indicator}' LIMIT 25
+Optional and advanced settings:
+- SILENTPUSH_API_BASE_URL
+- SILENTPUSH_META_API_BASE_URL
+- SILENTPUSH_V2_API_BASE_URL
+- SILENTPUSH_MAX_ENRICH_CALLS
+- SILENTPUSH_MAX_NON_EXPLORE_CALLS
+- SILENTPUSH_ENABLE_CONTEXT_GRAPH_SEARCH
+- SILENTPUSH_ENABLE_ENRICH_INDICATOR
+- SILENTPUSH_ENABLE_LIVE_SCAN
+- SILENTPUSH_ENABLE_THREAT_RANKING
+- SILENTPUSH_ENABLE_PADNS_LOOKUP
+- SILENTPUSH_ENABLE_BULK_ENRICH
+- SILENTPUSH_ENABLE_THREAT_CHECK
+- SILENTPUSH_THREAT_CHECK_BASE_URL
+- SILENTPUSH_BPH_SUSPECTED_DOMAIN_COUNT
+- SILENTPUSH_BPH_LIKELY_DOMAIN_COUNT
+- SILENTPUSH_VERBOSE_NON_EXPLORE_ERRORS
+- SILENTPUSH_VERBOSE_EXPLORE_ERRORS
+- SILENTPUSH_SPQL_PAYLOAD_MODE
+- SILENTPUSH_SPQL_QUERY_TEMPLATE
+- SILENTPUSH_SPQL_QUERY_TEMPLATE_ALT
 
 Notes for Context Graph Search SPQL:
 - `SILENTPUSH_SPQL_PAYLOAD_MODE` controls JSON key for the SPQL body (`auto`, `query`, `spql`, or `statement`).
@@ -90,6 +115,30 @@ Notes for Context Graph Search SPQL:
 - In `auto` mode, the app attempts common documented payload-key shapes but reports only concise per-family status unless verbose errors are enabled.
 - Live Scan is attempted for URL IOCs only; non-URL indicators are marked as skipped to avoid noisy server-side errors.
 - Explore enrichment output defaults to concise status (`explore_enrichment_status`), with detailed failed endpoint attempts only when `SILENTPUSH_VERBOSE_EXPLORE_ERRORS=true`.
+
+## CLI Usage
+Single IOC:
+- `python threat_lookup.py 8.8.8.8`
+
+Batch input file:
+- `python threat_lookup.py --file data/iocs.txt --format json --output results.json`
+
+Supported input files:
+- TXT (one IOC per line)
+- XLSX/XLS (first column)
+
+Output formats:
+- json
+- csv
+- xlsx (requires `--output`)
+
+Useful runtime options:
+- `--workers`
+- `--delay`
+- `--jitter`
+- `--batch-size`
+- `--batch-cooldown`
+- `--max-iocs`
 
 ## Scoring Model
 Threat Lookup calculates a composite risk score from source-specific evidence, then maps that score to a verdict.
@@ -148,8 +197,6 @@ Early high-confidence override:
 - Add richer incident context such as first-seen/last-seen timelines, related infrastructure pivots, and stronger campaign correlation.
 - Add  integration with SIEM, EDR, MISP or case-management tooling for validation against internal telemetry.
 
-## Supervisor Handoff
-Use the threat_lookup_final folder when sharing with your supervisor. It includes the runnable app, setup scripts, docs, and sample IOC data in one place.
 
 ## Notes
 - This tool provides triage intelligence and confidence-based context.

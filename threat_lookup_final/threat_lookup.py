@@ -140,8 +140,6 @@ RETRY_BASE_DELAY = 0.6
 RETRY_JITTER = 0.25
 RETRY_MAX_DELAY = 1.5
 
-ALLOWLIST = {"8.8.8.8", "1.1.1.1", "google.com"}
-
 _SHA256_RE = re.compile(r'^[0-9a-fA-F]{64}$')
 _SHA1_RE   = re.compile(r'^[0-9a-fA-F]{40}$')
 _MD5_RE    = re.compile(r'^[0-9a-fA-F]{32}$')
@@ -624,9 +622,14 @@ def _silentpush_verdict_from_risk(risk_score: int) -> str:
 
 
 def _spur_verdict_from_signals(risks: List[str], tunnel_count: int, proxy_count: int) -> str:
-    if risks:
+    risk_text = " ".join(str(r or "") for r in risks).lower()
+    high_severity_markers = (
+        "botnet", "malware", "phish", "c2", "command_and_control",
+        "ransom", "exploit", "ddos", "bruteforce", "scanner",
+    )
+    if (risks and any(marker in risk_text for marker in high_severity_markers)) or len(risks) >= 3:
         return "Malicious"
-    if tunnel_count > 0 or proxy_count > 0:
+    if risks or tunnel_count > 0 or proxy_count > 0:
         return "Suspicious"
     return "Benign"
 
@@ -1714,7 +1717,8 @@ def _rl_leaf_items(value, prefix: str = "", depth: int = 0):
 
 
 def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
-    malicious_terms = ("malicious", "phishing", "malware", "c2", "botnet", "suspicious")
+    malicious_terms = ("malicious", "phishing", "malware", "c2", "botnet")
+    suspicious_terms = ("suspicious",)
     benign_terms = ("benign", "clean", "safe", "trusted")
 
     leaf_items = list(_rl_leaf_items(data))
@@ -1722,6 +1726,7 @@ def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
     threat_level = ""
     risk_score = None
     malicious_hits = 0
+    suspicious_hits = 0
     benign_hits = 0
 
     for key, val in leaf_items:
@@ -1745,6 +1750,8 @@ def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
 
         if any(term in text_l for term in malicious_terms):
             malicious_hits += 1
+        if any(term in text_l for term in suspicious_terms):
+            suspicious_hits += 1
         if any(term in text_l for term in benign_terms):
             benign_hits += 1
 
@@ -1774,9 +1781,25 @@ def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
     tp_total = int(tp_stats.get("total") or 0)
 
     threat_l = threat_level.lower()
-    if ("malicious" in cls_l) or ("high" in threat_l) or tp_malicious > 0 or malicious_hits > 0:
+    tp_mal_ratio = (tp_malicious / tp_total) if tp_total > 0 else 0.0
+    strong_third_party = (
+        tp_malicious >= 8
+        or (tp_total >= 40 and tp_malicious >= 5 and tp_mal_ratio >= 0.12)
+    )
+    risk_score_high = False
+    if risk_score is not None:
+        risk_score_high = (risk_score >= 0.8) if risk_score <= 1 else (risk_score >= 80)
+
+    if (
+        ("malicious" in cls_l)
+        or ("known_malicious" in cls_l)
+        or ("high" in threat_l)
+        or ("critical" in threat_l)
+        or strong_third_party
+        or risk_score_high
+    ):
         rl_verdict = "Malicious"
-    elif ("suspicious" in cls_l) or ("medium" in threat_l) or tp_suspicious > 0:
+    elif ("suspicious" in cls_l) or ("medium" in threat_l) or tp_suspicious > 0 or tp_malicious > 0 or suspicious_hits > 0:
         rl_verdict = "Suspicious"
     elif ("benign" in cls_l) or (tp_total > 0 and tp_malicious == 0 and tp_suspicious == 0 and tp_clean > 0):
         rl_verdict = "Benign"
@@ -1800,6 +1823,43 @@ def _rl_extract_signal(data: Dict[str, Any]) -> Dict[str, Any]:
         "third_party_detection_ratio": detection_ratio,
         "score": min(20, max(0, score)),
     }
+
+
+def _rl_has_strong_malicious_evidence(result: Dict[str, Any]) -> bool:
+    cls_l = str(result.get("classification") or "").lower()
+    threat_l = str(result.get("threat_level") or "").lower()
+
+    try:
+        tp_malicious = int(result.get("third_party_malicious") or 0)
+    except Exception:
+        tp_malicious = 0
+
+    try:
+        tp_total = int(result.get("third_party_total") or 0)
+    except Exception:
+        tp_total = 0
+
+    risk_score = result.get("risk_score")
+    risk_score_high = False
+    try:
+        if risk_score is not None:
+            risk_value = float(risk_score)
+            risk_score_high = (risk_value >= 0.8) if risk_value <= 1 else (risk_value >= 80)
+    except Exception:
+        risk_score_high = False
+
+    if "malicious" in cls_l or "known_malicious" in cls_l:
+        return True
+    if "high" in threat_l or "critical" in threat_l:
+        return True
+    tp_mal_ratio = (tp_malicious / tp_total) if tp_total > 0 else 0.0
+    if tp_malicious >= 8:
+        return True
+    if tp_total >= 40 and tp_malicious >= 5 and tp_mal_ratio >= 0.12:
+        return True
+    if risk_score_high:
+        return True
+    return False
 
 
 def _rl_extract_collection_values(payload: Any) -> List[Any]:
@@ -2175,8 +2235,9 @@ def early_exit(results):
             return True, f"Silent Push returned high-severity malicious indicators (risk score {r.get('sp_risk_score')}/100)"
         if r["source"] == "spur" and r.get("spur_verdict") == "Malicious":
             risk_count = len(r.get("risks") or [])
-            return True, f"Spur returned malicious-class risk indicators ({risk_count} risk signal(s))"
-        if r["source"] == "reversinglabs" and r.get("rl_verdict") == "Malicious":
+            if int(r.get("score") or 0) >= 12:
+                return True, f"Spur returned malicious-class risk indicators ({risk_count} risk signal(s))"
+        if r["source"] == "reversinglabs" and r.get("rl_verdict") == "Malicious" and _rl_has_strong_malicious_evidence(r):
             return True, "ReversingLabs returned a malicious verdict"
         if r["source"] == "abuseipdb" and r.get("abuse_score", 0) > 90:
             return True, f"Very high AbuseIPDB confidence score ({r['abuse_score']}/100)"
@@ -2195,9 +2256,6 @@ async def analyze_with_session(
 ):
     start = time.time()
     ioc = ioc.strip()
-
-    if ioc in ALLOWLIST:
-        return {"ioc": ioc, "verdict": "Benign", "score": 0, "reason": "Allowlisted", "time_taken": 0}
 
     ioc_type = detect_type(ioc)
 
@@ -2352,20 +2410,7 @@ def _prepare_iocs(iocs: List[str], max_iocs: int = 0) -> List[str]:
 # ----------------------------
 EXPORT_FIELDNAMES = [
     "ioc", "type", "verdict", "score", "time_taken", "reason", "reasons",
-    "source_count", "source_errors",
-    "vt_malicious", "vt_suspicious", "vt_detected_by", "vt_country", "vt_continent",
-    "vt_asn", "vt_as_owner", "vt_network", "vt_tags", "vt_last_analysed",
-    "vt_community_reputation", "vt_community_votes", "vt_error",
-    "otx_pulses", "otx_country_name", "otx_city", "otx_asn", "otx_pulse_names",
-    "otx_malware_families", "otx_tags", "otx_targeted_countries", "otx_attack_ids",
-    "otx_adversaries", "otx_industries_targeted", "otx_error",
-    "abuse_score", "abuse_total_reports", "abuse_distinct_reporters", "abuse_country",
-    "abuse_isp", "abuse_domain", "abuse_usage_type", "abuse_is_tor", "abuse_is_whitelisted",
-    "abuse_last_reported_at", "abuse_hostnames", "abuse_error",
-    "threatfox_matches", "threatfox_ioc_types", "threatfox_max_confidence",
-    "threatfox_malware_families", "threatfox_threat_types", "threatfox_tags",
-    "threatfox_first_seen", "threatfox_last_seen", "threatfox_references",
-    "threatfox_malware_aliases", "threatfox_error",
+    "source_count",
     "silentpush_query", "silentpush_query_type", "silentpush_data_source", "silentpush_endpoint", "silentpush_sp_risk_score",
     "silentpush_sp_verdict", "silentpush_sp_risk_score_decider", "silentpush_answer", "silentpush_answer_asn",
     "silentpush_answer_as_name", "silentpush_country_code", "silentpush_subnet", "silentpush_asn_reputation",
@@ -2397,7 +2442,6 @@ EXPORT_FIELDNAMES = [
     "rl_highlights", "rl_related_urls_count", "rl_related_urls_sample",
     "rl_resolutions_count", "rl_resolutions_sample",
     "rl_downloaded_files_count", "rl_downloaded_files_sample", "rl_error",
-    "sources_json",
 ]
 
 
@@ -2411,6 +2455,27 @@ def _join_export_value(value):
 
 def _src_by_name(sources, name):
     return next((s for s in sources if s.get("source") == name), {})
+
+
+def _redact_export_reasons(reasons: list) -> list:
+    blocked_terms = (
+        "virustotal",
+        "vt:",
+        "alienvault",
+        "otx",
+        "abuseipdb",
+        "threatfox",
+    )
+    cleaned = []
+    for reason in reasons or []:
+        text = str(reason).strip()
+        if not text:
+            continue
+        lower = text.lower()
+        if any(term in lower for term in blocked_terms):
+            continue
+        cleaned.append(text)
+    return cleaned
 
 
 def _flatten_export_rows(rows):
@@ -2435,70 +2500,10 @@ def _flatten_export_rows(rows):
         spur = _src_by_name(sources, "spur")
         rl = _src_by_name(sources, "reversinglabs")
 
+        reason_list = _redact_export_reasons(row.get("reasons", []) or ([row.get("reason")] if row.get("reason") else []))
+        row_copy["reason"] = reason_list[0] if reason_list else row_copy["reason"]
+        row_copy["reasons"] = "; ".join(reason_list)
         row_copy["source_count"] = len(sources)
-        row_copy["source_errors"] = "; ".join(
-            f"{s.get('source')}:{s.get('error')}" for s in sources if s.get("error")
-        )
-
-        row_copy.update({
-            "vt_malicious": vt.get("malicious"),
-            "vt_suspicious": vt.get("suspicious"),
-            "vt_detected_by": _join_export_value(vt.get("detected_by", [])),
-            "vt_country": vt.get("country"),
-            "vt_continent": vt.get("continent"),
-            "vt_asn": vt.get("asn"),
-            "vt_as_owner": vt.get("as_owner"),
-            "vt_network": vt.get("network"),
-            "vt_tags": _join_export_value(vt.get("tags", [])),
-            "vt_last_analysed": vt.get("last_analysed"),
-            "vt_community_reputation": vt.get("community_reputation"),
-            "vt_community_votes": _join_export_value(vt.get("community_votes", {})),
-            "vt_error": vt.get("error"),
-        })
-
-        row_copy.update({
-            "otx_pulses": otx.get("pulses"),
-            "otx_country_name": otx.get("country_name"),
-            "otx_city": otx.get("city"),
-            "otx_asn": otx.get("asn"),
-            "otx_pulse_names": _join_export_value(otx.get("pulse_names", [])),
-            "otx_malware_families": _join_export_value(otx.get("malware_families", [])),
-            "otx_tags": _join_export_value(otx.get("tags", [])),
-            "otx_targeted_countries": _join_export_value(otx.get("targeted_countries", [])),
-            "otx_attack_ids": _join_export_value(otx.get("attack_ids", [])),
-            "otx_adversaries": _join_export_value(otx.get("adversaries", [])),
-            "otx_industries_targeted": _join_export_value(otx.get("industries_targeted", [])),
-            "otx_error": otx.get("error"),
-        })
-
-        row_copy.update({
-            "abuse_score": abuse.get("abuse_score"),
-            "abuse_total_reports": abuse.get("total_reports"),
-            "abuse_distinct_reporters": abuse.get("distinct_reporters"),
-            "abuse_country": abuse.get("country"),
-            "abuse_isp": abuse.get("isp"),
-            "abuse_domain": abuse.get("domain"),
-            "abuse_usage_type": abuse.get("usage_type"),
-            "abuse_is_tor": abuse.get("is_tor"),
-            "abuse_is_whitelisted": abuse.get("is_whitelisted"),
-            "abuse_last_reported_at": abuse.get("last_reported_at"),
-            "abuse_hostnames": _join_export_value(abuse.get("hostnames", [])),
-            "abuse_error": abuse.get("error"),
-        })
-
-        row_copy.update({
-            "threatfox_matches": tf.get("matches"),
-            "threatfox_ioc_types": _join_export_value(tf.get("ioc_types", [])),
-            "threatfox_max_confidence": tf.get("max_confidence"),
-            "threatfox_malware_families": _join_export_value(tf.get("malware_families", [])),
-            "threatfox_threat_types": _join_export_value(tf.get("threat_types", [])),
-            "threatfox_tags": _join_export_value(tf.get("tags", [])),
-            "threatfox_first_seen": tf.get("first_seen"),
-            "threatfox_last_seen": tf.get("last_seen"),
-            "threatfox_references": _join_export_value(tf.get("references", [])),
-            "threatfox_malware_aliases": _join_export_value(tf.get("malware_aliases", [])),
-            "threatfox_error": tf.get("error"),
-        })
 
         row_copy.update({
             "silentpush_query": sp.get("query"),
@@ -2623,7 +2628,6 @@ def _flatten_export_rows(rows):
             "rl_error": rl.get("error"),
         })
 
-        row_copy["sources_json"] = json.dumps(sources, separators=(",", ":"))
         flat_rows.append(row_copy)
     return flat_rows
 
