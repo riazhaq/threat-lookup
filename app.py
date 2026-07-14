@@ -838,11 +838,11 @@ with st.sidebar:
     st.divider()
 
     with st.expander("⚙️ Settings"):
-        workers = st.slider("Concurrent workers", 1, 5, 5,
-                            help="Higher = faster but more API pressure")
-        delay   = st.slider("Delay between starts (s)", 0.2, 3.0, 0.2, 0.1,
-                            help="Minimum pause between IOC batches")
-        jitter  = st.slider("Jitter (s)", 0.0, 1.0, 0.05, 0.05,
+        workers = st.slider("Concurrent workers", 1, 20, 10,
+                    help="Higher = faster but increases API pressure (recommended: 8-12 for paid tiers)")
+        delay   = st.slider("Delay between starts (s)", 0.01, 3.0, 0.01, 0.01,
+                    help="Minimum pause between IOC starts")
+        jitter  = st.slider("Jitter (s)", 0.0, 1.0, 0.0, 0.01,
                             help="Random extra delay to avoid burst patterns")
 
     st.divider()

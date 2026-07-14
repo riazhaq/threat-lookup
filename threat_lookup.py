@@ -14,7 +14,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from urllib.parse import urlparse, quote
 
 # Load key-value pairs from .env into process environment if present.
@@ -2479,11 +2479,7 @@ async def query_reversinglabs(session, ioc, ioc_type):
     related_resolutions = {"count": 0, "sample": []}
     related_downloads = {"count": 0, "sample": []}
     if ioc_type == "ip":
-        for path, sink in (
-            (f"/api/network-threat-intel/ip/{ioc}/urls/", "urls"),
-            (f"/api/network-threat-intel/ip/{ioc}/resolutions/", "resolutions"),
-            (f"/api/network-threat-intel/ip/{ioc}/downloaded_files/", "downloads"),
-        ):
+        async def fetch_related(path: str, sink: str):
             s2, d2, e2 = await _request_json_with_retry(
                 session,
                 "GET",
@@ -2491,8 +2487,18 @@ async def query_reversinglabs(session, ioc, ioc_type):
                 headers=headers,
             )
             if e2 or s2 in {401, 403, 404, 429}:
+                return sink, None
+            return sink, _rl_summarize_collection(d2)
+
+        related_tasks = [
+            fetch_related(f"/api/network-threat-intel/ip/{ioc}/urls/", "urls"),
+            fetch_related(f"/api/network-threat-intel/ip/{ioc}/resolutions/", "resolutions"),
+            fetch_related(f"/api/network-threat-intel/ip/{ioc}/downloaded_files/", "downloads"),
+        ]
+        related_results = await asyncio.gather(*related_tasks)
+        for sink, summary in related_results:
+            if not summary:
                 continue
-            summary = _rl_summarize_collection(d2)
             if sink == "urls":
                 related_urls = summary
             elif sink == "resolutions":
@@ -2701,23 +2707,50 @@ async def analyze_with_session(
         "spur",
     ])
 
-    tasks = []
+    async def timed_call(source_name: str, coro):
+        t0 = time.monotonic()
+        try:
+            result = await coro
+        except Exception as exc:
+            return {
+                "source": source_name,
+                "score": 0,
+                "error": f"exception:{type(exc).__name__}",
+                "latency_s": round(time.monotonic() - t0, 3),
+            }
+
+        elapsed = round(time.monotonic() - t0, 3)
+        if isinstance(result, dict):
+            out = dict(result)
+            out.setdefault("source", source_name)
+            out["latency_s"] = elapsed
+            return out
+
+        return {
+            "source": source_name,
+            "score": 0,
+            "error": "invalid_result",
+            "latency_s": elapsed,
+        }
+
+    source_calls: List[Tuple[str, Any]] = []
     if "virustotal" in enabled:
-        tasks.append(query_virustotal(session, ioc, ioc_type))
+        source_calls.append(("virustotal", query_virustotal(session, ioc, ioc_type)))
     if "alienvault" in enabled:
-        tasks.append(query_alienvault(session, ioc, ioc_type))
+        source_calls.append(("alienvault", query_alienvault(session, ioc, ioc_type)))
     if "threatfox" in enabled:
-        tasks.append(query_threatfox(session, ioc, ioc_type))
+        source_calls.append(("threatfox", query_threatfox(session, ioc, ioc_type)))
     if "silentpush" in enabled:
-        tasks.append(query_silentpush(session, ioc, ioc_type))
+        source_calls.append(("silentpush", query_silentpush(session, ioc, ioc_type)))
     if "reversinglabs" in enabled:
-        tasks.append(query_reversinglabs(session, ioc, ioc_type))
+        source_calls.append(("reversinglabs", query_reversinglabs(session, ioc, ioc_type)))
     if ioc_type == "ip":
         if "abuseipdb" in enabled:
-            tasks.append(query_abuseipdb(session, ioc))
+            source_calls.append(("abuseipdb", query_abuseipdb(session, ioc)))
         if "spur" in enabled:
-            tasks.append(query_spur(session, ioc, ioc_type))
+            source_calls.append(("spur", query_spur(session, ioc, ioc_type)))
 
+    tasks = [timed_call(name, coro) for name, coro in source_calls]
     results = await asyncio.gather(*tasks)
 
     exit_flag, reason = early_exit(results)
@@ -2755,7 +2788,8 @@ async def analyze_bulk(
         return []
 
     workers = max(1, workers)
-    delay = max(0.0, delay)
+    # Keep a small floor to avoid zero-interval bursts across concurrent workers.
+    delay = max(0.01, delay)
     jitter = max(0.0, jitter)
 
     semaphore = asyncio.Semaphore(workers)
@@ -3208,6 +3242,71 @@ def _autosize_worksheet_columns(worksheet, max_width: int = 60) -> None:
         worksheet.column_dimensions[column].width = min(max(10, max_len + 2), max_width)
 
 
+def _as_result_list(output: Any) -> List[Dict[str, Any]]:
+    if isinstance(output, list):
+        return [r for r in output if isinstance(r, dict)]
+    if isinstance(output, dict):
+        return [output]
+    return []
+
+
+def _percentile(values: List[float], p: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = max(0, min(len(ordered) - 1, int(round((len(ordered) - 1) * p))))
+    return ordered[idx]
+
+
+def print_profile_summary(output: Any) -> None:
+    rows = _as_result_list(output)
+    if not rows:
+        print("[PROFILE] No results available.", file=sys.stderr)
+        return
+
+    ioc_times = [float(r.get("time_taken") or 0.0) for r in rows]
+    avg_ioc = sum(ioc_times) / len(ioc_times) if ioc_times else 0.0
+    p95_ioc = _percentile(ioc_times, 0.95)
+
+    source_stats: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        for src in row.get("sources", []) or []:
+            if not isinstance(src, dict):
+                continue
+            name = str(src.get("source") or "unknown")
+            st = source_stats.setdefault(name, {"count": 0, "latencies": [], "errors": 0, "timeouts": 0})
+            st["count"] += 1
+            latency = float(src.get("latency_s") or 0.0)
+            st["latencies"].append(latency)
+            if src.get("error"):
+                st["errors"] += 1
+                if str(src.get("error")).lower() == "timeout":
+                    st["timeouts"] += 1
+
+    print("[PROFILE] ----------", file=sys.stderr)
+    print(f"[PROFILE] IOC count: {len(rows)}", file=sys.stderr)
+    print(f"[PROFILE] IOC total wall time (sum of per-IOC): {sum(ioc_times):.2f}s", file=sys.stderr)
+    print(f"[PROFILE] IOC avg: {avg_ioc:.2f}s | p95: {p95_ioc:.2f}s | max: {max(ioc_times) if ioc_times else 0.0:.2f}s", file=sys.stderr)
+    print("[PROFILE] Source latency summary (avg/p95/max, error_count, timeout_count):", file=sys.stderr)
+
+    ranked = []
+    for name, st in source_stats.items():
+        latencies = [float(v) for v in st.get("latencies", [])]
+        avg_lat = (sum(latencies) / len(latencies)) if latencies else 0.0
+        ranked.append((avg_lat, name, st, latencies))
+
+    for _, name, st, latencies in sorted(ranked, reverse=True):
+        p95 = _percentile(latencies, 0.95)
+        mx = max(latencies) if latencies else 0.0
+        print(
+            f"[PROFILE] {name:14s} avg={sum(latencies)/len(latencies):.2f}s p95={p95:.2f}s max={mx:.2f}s "
+            f"errors={st['errors']} timeouts={st['timeouts']}",
+            file=sys.stderr,
+        )
+
+    print("[PROFILE] ----------", file=sys.stderr)
+
+
 def write_xlsx_results(results, output_path: str) -> None:
     try:
         from openpyxl import Workbook
@@ -3263,18 +3362,20 @@ def main():
     parser.add_argument("--file",   metavar="PATH",  help="Text file with one IOC per line")
     parser.add_argument("--output", metavar="PATH",  help="Write results to this file instead of stdout")
     parser.add_argument("--format", choices=["json", "csv", "xlsx"], default="json", help="Output format (default: json)")
-    parser.add_argument("--delay",  type=float, default=1.0, metavar="SECS",
-                        help="Global minimum seconds between IOC starts in bulk mode (default: 1.0)")
-    parser.add_argument("--workers", type=int, default=2, metavar="N",
-                        help="Concurrent IOC workers in bulk mode (default: 2)")
-    parser.add_argument("--jitter", type=float, default=0.25, metavar="SECS",
-                        help="Random extra delay added per IOC start to avoid burst patterns (default: 0.25)")
+    parser.add_argument("--delay",  type=float, default=0.01, metavar="SECS",
+                        help="Global minimum seconds between IOC starts in bulk mode (minimum/default: 0.01)")
+    parser.add_argument("--workers", type=int, default=10, metavar="N",
+                        help="Concurrent IOC workers in bulk mode (default: 10)")
+    parser.add_argument("--jitter", type=float, default=0.0, metavar="SECS",
+                        help="Random extra delay added per IOC start to avoid burst patterns (default: 0.0)")
     parser.add_argument("--batch-size", type=int, default=150, metavar="N",
                         help="Maximum IOCs processed per batch before cooldown (default: 150)")
     parser.add_argument("--batch-cooldown", type=float, default=30.0, metavar="SECS",
                         help="Pause between batches in bulk mode to avoid API bursts (default: 30)")
     parser.add_argument("--max-iocs", type=int, default=0, metavar="N",
                         help="Optional cap on number of unique IOCs to process (0 = no cap)")
+    parser.add_argument("--profile", action="store_true",
+                        help="Print IOC/source latency profile summary to stderr")
 
     args = parser.parse_args()
 
@@ -3326,6 +3427,9 @@ def main():
             output = asyncio.run(analyze_bulk(iocs, args.workers, args.delay, args.jitter))
     else:
         output = asyncio.run(analyze(args.ioc))
+
+    if args.profile:
+        print_profile_summary(output)
 
     if args.format == "xlsx":
         if not args.output:

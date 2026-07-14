@@ -95,9 +95,9 @@ python threat_lookup.py --file data/iocs.txt --format json --output outputs/resu
 
 Common bulk tuning options:
 
-- `--workers` concurrent IOC workers (default `2`)
-- `--delay` minimum seconds between IOC starts (default `1.0`)
-- `--jitter` random extra delay to reduce burst patterns (default `0.25`)
+- `--workers` concurrent IOC workers (default `10`)
+- `--delay` minimum seconds between IOC starts (minimum/default `0.01`)
+- `--jitter` random extra delay to reduce burst patterns (default `0.0`)
 - `--batch-size` IOC chunk size before cooldown (default `150`)
 - `--batch-cooldown` pause between batches in seconds (default `30`)
 - `--max-iocs` optional cap after deduplication (default `0`, no cap)
