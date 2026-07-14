@@ -5,7 +5,7 @@ Threat Lookup is a multi-source IOC triage tool with both:
 - A Streamlit dashboard for analyst-friendly investigation
 - A CLI for batch processing and exports
 
-The project enriches indicators from several intelligence providers, builds a composite risk score, and returns a final verdict with supporting evidence.
+The project obtains indicators from several intelligence providers, builds a composite risk score, and returns a final verdict with supporting evidence.
 
 ## What It Supports
 
@@ -192,9 +192,9 @@ The IOC is immediately labeled Malicious (score 100) when one of these triggers 
 - `docs/uml.md` - architecture and data-flow diagrams
 - `docs/sdlc.md` - SDLC and governance notes
 
-## Supervisor Handoff
+## Handoff
 
-Use `threat_lookup_final/` when sharing with a supervisor. It contains a runnable package with code, docs, and sample input.
+Use `threat_lookup_final/` when sharing with a new developer. It contains a runnable package with code, docs, and sample input.
 
 ## Disclaimer
 
