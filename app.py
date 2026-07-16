@@ -7,7 +7,9 @@ import os
 import sys
 import time
 from pathlib import Path
+from urllib.parse import quote
 
+import aiohttp
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -123,13 +125,13 @@ SOURCE_ICONS = {
 }
 
 SOURCE_BRAND = {
-    "VirusTotal": "var(--source-unified-color)",
-    "AlienVault OTX": "var(--source-unified-color)",
-    "ThreatFox": "var(--source-unified-color)",
-    "AbuseIPDB": "var(--source-unified-color)",
-    "Silent Push": "var(--source-unified-color)",
-    "Spur": "var(--source-unified-color)",
-    "ReversingLabs": "var(--source-unified-color)",
+    "VirusTotal": "var(--text-color)",
+    "AlienVault OTX": "var(--text-color)",
+    "ThreatFox": "var(--text-color)",
+    "AbuseIPDB": "var(--text-color)",
+    "Silent Push": "var(--text-color)",
+    "Spur": "var(--text-color)",
+    "ReversingLabs": "var(--text-color)",
 }
 
 # Keep card labels high-contrast on white tile backgrounds in both light/dark themes.
@@ -216,9 +218,255 @@ def color_verdict_cell(val):
     return ""
 
 
-def run_analysis(iocs, workers, delay, jitter, enabled_sources):
+def _normalize_pivot_sample(items, max_related):
+    sample = []
+    seen = set()
+    for item in items:
+        value = None
+        if isinstance(item, str):
+            value = item.strip()
+        elif isinstance(item, dict):
+            for candidate_key in (
+                "value", "url", "domain", "ip", "sha256", "sha1", "md5",
+                "filename", "name", "host", "indicator",
+            ):
+                candidate = item.get(candidate_key)
+                if candidate not in (None, "", []):
+                    value = str(candidate).strip()
+                    break
+            if value is None:
+                value = str({k: item.get(k) for k in list(item.keys())[:3]})
+        else:
+            value = str(item).strip()
+
+        if not value:
+            continue
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        sample.append(value)
+        if len(sample) >= max_related:
+            break
+    return sample
+
+
+def _build_rl_pivot_specs(ioc, ioc_type):
+    ioc_enc = quote(str(ioc), safe="")
+    specs = []
+
+    if ioc_type == "ip":
+        specs.extend([
+            {"name": "related_urls", "method": "GET", "path": f"/api/network-threat-intel/ip/{ioc_enc}/urls/", "params": None},
+            {"name": "resolutions", "method": "GET", "path": f"/api/network-threat-intel/ip/{ioc_enc}/resolutions/", "params": None},
+            {"name": "downloaded_files", "method": "GET", "path": f"/api/network-threat-intel/ip/{ioc_enc}/downloaded_files/", "params": None},
+        ])
+    elif ioc_type == "domain":
+        specs.extend([
+            {"name": "resolutions", "method": "GET", "path": f"/api/network-threat-intel/domain/{ioc_enc}/resolutions/", "params": None},
+            {"name": "related_urls", "method": "GET", "path": f"/api/network-threat-intel/domain/{ioc_enc}/urls/", "params": None},
+            {"name": "downloaded_files", "method": "GET", "path": f"/api/network-threat-intel/domain/{ioc_enc}/downloaded_files/", "params": None},
+        ])
+    elif ioc_type == "url":
+        specs.extend([
+            {"name": "related_urls", "method": "GET", "path": "/api/network-threat-intel/url/", "params": {"url": ioc}},
+            {"name": "related_urls", "method": "GET", "path": "/api/network-threat-intel/url/", "params": {"value": ioc}},
+            {"name": "related_urls", "method": "GET", "path": "/api/network-threat-intel/url/", "params": {"q": ioc}},
+        ])
+    elif ioc_type == "hash":
+        specs.extend([
+            {"name": "sample_relationships", "method": "GET", "path": f"/api/samples/v3/{ioc_enc}/", "params": None},
+            {"name": "downloaded_files", "method": "GET", "path": f"/api/samples/v3/{ioc_enc}/parents/", "params": None},
+            {"name": "downloaded_files", "method": "GET", "path": f"/api/samples/v3/{ioc_enc}/children/", "params": None},
+        ])
+
+    return specs
+
+
+async def _query_rl_pivot_family(session, ioc, ioc_type, max_related):
+    specs = _build_rl_pivot_specs(ioc, ioc_type)
+    if not specs:
+        return {"status": "skipped", "reason": "unsupported_ioc_type", "families": []}
+
+    headers = tl._rl_auth_headers()
+    families = {}
+    success_count = 0
+
+    for spec in specs:
+        family = spec["name"]
+        if family in families and families[family].get("status") == "ok":
+            continue
+
+        status, payload, request_error, _ = await tl._request_json_with_retry(
+            session,
+            spec["method"],
+            f"{tl.RL_SPECTRA_BASE_URL}{spec['path']}",
+            headers=headers,
+            params=spec.get("params"),
+            return_headers=True,
+        )
+
+        if request_error:
+            families.setdefault(family, {
+                "family": family,
+                "status": "error",
+                "endpoint": spec["path"],
+                "reason": request_error,
+                "count": 0,
+                "sample": [],
+            })
+            continue
+
+        if status in {401, 403, 404, 405, 429}:
+            families.setdefault(family, {
+                "family": family,
+                "status": "unavailable",
+                "endpoint": spec["path"],
+                "reason": f"http_{status}",
+                "count": 0,
+                "sample": [],
+            })
+            continue
+
+        if status and status >= 400:
+            families.setdefault(family, {
+                "family": family,
+                "status": "error",
+                "endpoint": spec["path"],
+                "reason": f"http_{status}",
+                "count": 0,
+                "sample": [],
+            })
+            continue
+
+        items = tl._rl_extract_collection_values(payload)
+        if not items and isinstance(payload, dict):
+            items = [payload]
+        sample = _normalize_pivot_sample(items, max_related=max_related)
+        families[family] = {
+            "family": family,
+            "status": "ok",
+            "endpoint": spec["path"],
+            "reason": "",
+            "count": len(items),
+            "sample": sample,
+        }
+        success_count += 1
+
+    family_list = list(families.values())
+    total_linked = sum(int(f.get("count") or 0) for f in family_list)
+    return {
+        "status": "ok" if success_count > 0 else "unavailable",
+        "families": family_list,
+        "family_successes": success_count,
+        "family_attempted": len(specs),
+        "linked_artifact_total": total_linked,
+    }
+
+
+def _extract_seed_links_from_rl_source(rl_src, max_related):
+    seeds = {
+        "related_ip_sample": rl_src.get("related_ip_sample") or [],
+        "related_domain_sample": rl_src.get("related_domain_sample") or [],
+        "related_url_payload_sample": rl_src.get("related_url_payload_sample") or [],
+        "related_hash_sample": rl_src.get("related_hash_sample") or [],
+        "downloaded_files_sample": rl_src.get("downloaded_files_sample") or [],
+        "resolutions_sample": rl_src.get("resolutions_sample") or [],
+        "related_urls_sample": rl_src.get("related_urls_sample") or [],
+    }
+    compact = {}
+    for key, values in seeds.items():
+        if values:
+            compact[key] = [str(v) for v in values[:max_related]]
+    return compact
+
+
+async def _run_reversinglabs_deep_dive(results, max_iocs, min_score, max_related):
+    if not results:
+        return results
+    if not tl.RL_SPECTRA_BASE_URL:
+        return results
+    if not tl.RL_SPECTRA_TOKEN:
+        return results
+
+    candidates = []
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if str(result.get("verdict") or "") != "Malicious":
+            continue
+        score = int(result.get("score") or 0)
+        if score < min_score:
+            continue
+        candidates.append(result)
+
+    if not candidates:
+        return results
+
+    async with aiohttp.ClientSession() as session:
+        for result in candidates[:max_iocs]:
+            rl_src = _source_by_name(result, "reversinglabs")
+            if rl_src.get("error"):
+                result["deep_dive"] = {
+                    "status": "skipped",
+                    "reason": f"reversinglabs_{rl_src.get('error')}",
+                }
+                continue
+
+            ioc = result.get("ioc")
+            ioc_type = result.get("type")
+            seed_links = _extract_seed_links_from_rl_source(rl_src, max_related=max_related)
+            pivot_data = await _query_rl_pivot_family(session, ioc, ioc_type, max_related=max_related)
+
+            result["deep_dive"] = {
+                "status": pivot_data.get("status"),
+                "reason": pivot_data.get("reason", ""),
+                "ioc": ioc,
+                "ioc_type": ioc_type,
+                "seed_links": seed_links,
+                "pivot": pivot_data,
+                "settings": {
+                    "max_related": max_related,
+                    "min_score": min_score,
+                },
+            }
+
+    return results
+
+
+def run_analysis(
+    iocs,
+    workers,
+    delay,
+    jitter,
+    enabled_sources,
+    deep_dive_enabled=False,
+    deep_dive_max_iocs=5,
+    deep_dive_min_score=70,
+    deep_dive_max_related=15,
+):
     refresh_lookup_config()
-    return asyncio.run(tl.analyze_bulk(iocs, workers, delay, jitter, enabled_sources=enabled_sources))
+    results = asyncio.run(tl.analyze_bulk(iocs, workers, delay, jitter, enabled_sources=enabled_sources))
+    if not deep_dive_enabled:
+        return results
+
+    if "reversinglabs" not in set(enabled_sources or []):
+        for row in results:
+            if isinstance(row, dict) and str(row.get("verdict") or "") == "Malicious":
+                row["deep_dive"] = {
+                    "status": "skipped",
+                    "reason": "reversinglabs_source_not_enabled",
+                }
+        return results
+
+    return asyncio.run(
+        _run_reversinglabs_deep_dive(
+            results,
+            max_iocs=max(1, int(deep_dive_max_iocs)),
+            min_score=max(0, int(deep_dive_min_score)),
+            max_related=max(5, int(deep_dive_max_related)),
+        )
+    )
 
 
 def _fmt_simple_value(value):
@@ -744,6 +992,56 @@ def _build_ioc_summary(detail: dict) -> str:
     return f"{verdict} with score {score}/100 based on the currently available provider evidence."
 
 
+def _render_deep_dive_section(detail: dict) -> None:
+    deep = detail.get("deep_dive") or {}
+    if not deep:
+        return
+
+    st.markdown("---")
+    st.markdown("### ReversingLabs Deep Dive")
+    status = str(deep.get("status") or "unknown")
+    reason = deep.get("reason")
+
+    if status == "skipped":
+        st.caption(f"Deep Dive skipped: {reason or 'not eligible for current settings.'}")
+        return
+
+    pivot = deep.get("pivot") or {}
+    linked_total = int(pivot.get("linked_artifact_total") or 0)
+    family_successes = int(pivot.get("family_successes") or 0)
+    family_attempted = int(pivot.get("family_attempted") or 0)
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Linked Artifacts", linked_total)
+    d2.metric("Pivot Families", f"{family_successes}/{family_attempted}")
+    d3.metric("Deep Dive Status", status.upper())
+
+    families = pivot.get("families") or []
+    if families:
+        st.markdown("**Pivot family results:**")
+        for family in families:
+            label = str(family.get("family") or "family").replace("_", " ").title()
+            fam_status = family.get("status") or "unknown"
+            count = int(family.get("count") or 0)
+            endpoint = family.get("endpoint") or ""
+            sample = family.get("sample") or []
+            with st.expander(f"{label} · {fam_status} · {count} linked", expanded=False):
+                st.markdown(f"- **Endpoint:** {endpoint}")
+                if family.get("reason"):
+                    st.markdown(f"- **Reason:** {family.get('reason')}")
+                if sample:
+                    st.markdown(f"- **Sample:** {', '.join(str(v) for v in sample[:15])}")
+
+    seed_links = deep.get("seed_links") or {}
+    if seed_links:
+        with st.expander("Seed links from initial ReversingLabs result", expanded=False):
+            for key, values in seed_links.items():
+                if not values:
+                    continue
+                label = str(key).replace("_", " ").replace("sample", "sample").title()
+                st.markdown(f"- **{label}:** {', '.join(str(v) for v in values[:15])}")
+
+
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 🛡️ Threat Lookup")
@@ -774,7 +1072,7 @@ with st.sidebar:
     st.markdown("**API Status**")
     for name, ok in api_health().items():
         dot = "🟢" if ok else "🔴"
-        name_color = SOURCE_BRAND.get(name, "#111827")
+        name_color = SOURCE_BRAND.get(name, "var(--text-color)")
         st.markdown(
             f"{dot} &nbsp;<span style='color:{name_color}; font-weight:700;'>{name}</span>",
             unsafe_allow_html=True,
@@ -784,18 +1082,33 @@ with st.sidebar:
         remaining = spur_status.get("queries_remaining")
         tier = spur_status.get("service_tier") or "unknown"
         if remaining is not None:
-            st.caption(f"Spur: {remaining} queries remaining ({tier})")
+            st.markdown(
+                f"<span style='color:var(--text-color); opacity:0.92;'>Spur: {remaining} queries remaining ({tier})</span>",
+                unsafe_allow_html=True,
+            )
         else:
-            st.caption(f"Spur: active ({tier})")
+            st.markdown(
+                f"<span style='color:var(--text-color); opacity:0.92;'>Spur: active ({tier})</span>",
+                unsafe_allow_html=True,
+            )
     elif spur_status.get("error"):
-        st.caption(f"Spur status: {spur_status.get('error')}")
+        st.markdown(
+            f"<span style='color:var(--text-color); opacity:0.92;'>Spur status: {spur_status.get('error')}</span>",
+            unsafe_allow_html=True,
+        )
 
     rl_status = st.session_state.get("rl_status") or {}
     if rl_status.get("active"):
         rl_stat = rl_status.get("status") or "ok"
-        st.caption(f"ReversingLabs status: {rl_stat}")
+        st.markdown(
+            f"<span style='color:var(--text-color); opacity:0.92;'>ReversingLabs status: {rl_stat}</span>",
+            unsafe_allow_html=True,
+        )
     elif rl_status.get("error"):
-        st.caption(f"ReversingLabs status: {rl_status.get('error')}")
+        st.markdown(
+            f"<span style='color:var(--text-color); opacity:0.92;'>ReversingLabs status: {rl_status.get('error')}</span>",
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
@@ -845,6 +1158,37 @@ with st.sidebar:
         jitter  = st.slider("Jitter (s)", 0.0, 1.0, 0.0, 0.01,
                             help="Random extra delay to avoid burst patterns")
 
+    with st.expander("🧪 Deep Dive"):
+        deep_dive_enabled = st.checkbox(
+            "Enable ReversingLabs Deep Dive for malicious IOCs",
+            value=False,
+            help="Runs additional RL pivot calls only for malicious results that pass the score threshold.",
+        )
+        deep_dive_min_score = st.slider(
+            "Minimum score to deep dive",
+            0,
+            100,
+            70,
+            1,
+            help="Only malicious IOCs with score at or above this threshold are deep-dived.",
+        )
+        deep_dive_max_iocs = st.slider(
+            "Max malicious IOCs to deep dive",
+            1,
+            25,
+            5,
+            1,
+            help="Safety cap to control API usage for large runs.",
+        )
+        deep_dive_max_related = st.slider(
+            "Max linked artifacts per pivot family",
+            5,
+            50,
+            15,
+            1,
+            help="Limits how many linked artifacts are shown for each pivot family.",
+        )
+
     st.divider()
     run_btn = st.button(
         "🔍  Run Analysis",
@@ -870,7 +1214,17 @@ if "selected_ioc" not in st.session_state:
 if run_btn and ioc_list:
     with st.spinner(f"Analyzing {len(ioc_list)} IOC(s) across {len(selected_sources)} enabled source(s)…"):
         try:
-            st.session_state.results = run_analysis(ioc_list, workers, delay, jitter, selected_sources)
+            st.session_state.results = run_analysis(
+                ioc_list,
+                workers,
+                delay,
+                jitter,
+                selected_sources,
+                deep_dive_enabled=deep_dive_enabled,
+                deep_dive_max_iocs=deep_dive_max_iocs,
+                deep_dive_min_score=deep_dive_min_score,
+                deep_dive_max_related=deep_dive_max_related,
+            )
             st.session_state.run_time = time.strftime("%Y-%m-%d %H:%M:%S")
         except Exception as e:
             st.error(f"Analysis failed: {e}")
@@ -1056,6 +1410,8 @@ if detail:
         st.markdown("**Assessment rationale:**")
         for r in reasons:
             st.markdown(f"- {r}")
+
+    _render_deep_dive_section(detail)
 
     st.markdown("---")
 

@@ -123,13 +123,13 @@ SOURCE_ICONS = {
 }
 
 SOURCE_BRAND = {
-    "VirusTotal": "var(--source-unified-color)",
-    "AlienVault OTX": "var(--source-unified-color)",
-    "ThreatFox": "var(--source-unified-color)",
-    "AbuseIPDB": "var(--source-unified-color)",
-    "Silent Push": "var(--source-unified-color)",
-    "Spur": "var(--source-unified-color)",
-    "ReversingLabs": "var(--source-unified-color)",
+    "VirusTotal": "var(--text-color)",
+    "AlienVault OTX": "var(--text-color)",
+    "ThreatFox": "var(--text-color)",
+    "AbuseIPDB": "var(--text-color)",
+    "Silent Push": "var(--text-color)",
+    "Spur": "var(--text-color)",
+    "ReversingLabs": "var(--text-color)",
 }
 
 SOURCE_DISPLAY = {
@@ -307,7 +307,7 @@ with st.sidebar:
     st.markdown("**API Status**")
     for name, ok in api_health().items():
         dot = "🟢" if ok else "🔴"
-        name_color = SOURCE_BRAND.get(name, "#111827")
+        name_color = SOURCE_BRAND.get(name, "var(--text-color)")
         st.markdown(
             f"{dot} &nbsp;<span style='color:{name_color}; font-weight:700;'>{name}</span>",
             unsafe_allow_html=True,
@@ -317,18 +317,33 @@ with st.sidebar:
         remaining = spur_status.get("queries_remaining")
         tier = spur_status.get("service_tier") or "unknown"
         if remaining is not None:
-            st.caption(f"Spur: {remaining} queries remaining ({tier})")
+            st.markdown(
+                f"<span style='color:var(--text-color); opacity:0.92;'>Spur: {remaining} queries remaining ({tier})</span>",
+                unsafe_allow_html=True,
+            )
         else:
-            st.caption(f"Spur: active ({tier})")
+            st.markdown(
+                f"<span style='color:var(--text-color); opacity:0.92;'>Spur: active ({tier})</span>",
+                unsafe_allow_html=True,
+            )
     elif spur_status.get("error"):
-        st.caption(f"Spur status: {spur_status.get('error')}")
+        st.markdown(
+            f"<span style='color:var(--text-color); opacity:0.92;'>Spur status: {spur_status.get('error')}</span>",
+            unsafe_allow_html=True,
+        )
 
     rl_status = st.session_state.get("rl_status") or {}
     if rl_status.get("active"):
         rl_stat = rl_status.get("status") or "ok"
-        st.caption(f"ReversingLabs status: {rl_stat}")
+        st.markdown(
+            f"<span style='color:var(--text-color); opacity:0.92;'>ReversingLabs status: {rl_stat}</span>",
+            unsafe_allow_html=True,
+        )
     elif rl_status.get("error"):
-        st.caption(f"ReversingLabs status: {rl_status.get('error')}")
+        st.markdown(
+            f"<span style='color:var(--text-color); opacity:0.92;'>ReversingLabs status: {rl_status.get('error')}</span>",
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
